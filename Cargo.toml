@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bbolt-core",
+    "crates/bbolt",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["bbolt-rs2 contributors"]
+repository = "https://github.com/example/bbolt-rs2"
+
+[workspace.dependencies]
+# Dependencies shared across crates
+memmap2 = "0.9"
+thiserror = "2"

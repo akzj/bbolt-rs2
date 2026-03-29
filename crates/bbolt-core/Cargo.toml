@@ -1,0 +1,28 @@
+[package]
+name = "bbolt-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Core implementation of bbolt database"
+readme = "README.md"
+
+[dependencies]
+# Memory mapping
+memmap2 = "0.9"
+
+# Error handling
+thiserror = "2"
+
+# Bitflags for page flags
+bitflags = "2"
+
+# For testing
+tempfile = { version = "3", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
