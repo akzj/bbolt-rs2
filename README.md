@@ -144,8 +144,8 @@ bbolt-rs2 is **binary compatible** with Go bbolt files:
 | Leaf page reading | ✅ |
 | Leaf page writing | ✅ |
 | Inline bucket | ✅ |
-| Nested bucket | ❌ |
-| Freelist persistence | ❌ |
+| Freelist persistence | ✅ |
+| Nested bucket | 🔜 (stub) |
 
 ## Current Status
 
