@@ -134,7 +134,7 @@ test result: ok. 32 passed; 0 failed
 
 ## Cross-Compatibility
 
-bbolt-rs2 is **fully compatible** with Go bbolt files:
+bbolt-rs2 is **binary compatible** with Go bbolt files:
 
 | Feature | Status |
 |---------|--------|
@@ -144,8 +144,27 @@ bbolt-rs2 is **fully compatible** with Go bbolt files:
 | Leaf page reading | ✅ |
 | Leaf page writing | ✅ |
 | Inline bucket | ✅ |
-| Nested bucket | 🔜 |
-| Freelist persistence | 🔜 |
+| Nested bucket | ❌ |
+| Freelist persistence | ❌ |
+
+## Current Status
+
+### Implemented
+- [x] Page size auto-detection (512B - 16KB)
+- [x] Meta page read/write (magic, version, checksum)
+- [x] Leaf page read/write
+- [x] Inline bucket (sequential key-value storage)
+- [x] Basic cursor traversal
+- [x] Basic put/get/delete operations
+- [x] Read transactions
+- [x] Write transactions (with manual commit)
+
+### Not Yet Implemented
+- [ ] Nested bucket (create_bucket, create_bucket_if_not_exists, delete_bucket)
+- [ ] Freelist persistence (read/write freelist page)
+- [ ] Automatic page rebalancing
+- [ ] Bucket iteration (bucket.for_each())
+- [ ] FFI bindings
 
 ### Verified with Go bbolt
 
