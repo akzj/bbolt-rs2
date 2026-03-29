@@ -255,7 +255,7 @@ impl Db {
     /// Read an existing database
 
     /// Detect page size from file by looking for magic number
-    fn detect_page_size(data: &[u8]) -> Result<usize> {
+    pub fn detect_page_size(data: &[u8]) -> Result<usize> {
         const MAGIC: u32 = 0xED0CDAED;
         // Try common page sizes in descending order (larger first)
         let page_sizes = [16384, 8192, 4096, 2048, 1024, 512];

@@ -190,6 +190,27 @@ impl Default for Cursor {
     }
 }
 
+impl Cursor {
+    /// Debug: get stack length
+    pub fn stack_len(&self) -> usize {
+        self.stack.len()
+    }
+    
+    /// Debug: get current index in leaf
+    pub fn current_index(&self) -> Option<usize> {
+        self.stack.last().map(|r| r.index)
+    }
+    
+    /// Set inline data for cursor (for inline buckets)
+    pub fn set_inline_data(&mut self, data: Vec<u8>) {
+        // Clear existing stack
+        self.stack.clear();
+        // The data already starts from the page header (InBucket header was stripped)
+        // Create a synthetic ElemRef with the inline data
+        self.stack.push(ElemRef::new_from_inline(0, data));
+    }
+}
+
 /// Reference to an element on a page
 struct ElemRef {
     /// Page info
@@ -201,6 +222,13 @@ struct ElemRef {
 }
 
 impl ElemRef {
+    /// Create from inline data (for inline buckets)
+    fn new_from_inline(pgid: u64, data: Vec<u8>) -> Self {
+        // Same as new but takes owned data
+        let mut s = Self::new(pgid, Some(data));
+        s
+    }
+    
     fn new(pgid: u64, data: Option<Vec<u8>>) -> Self {
         // Parse page header from data
         // Page header: id(8) + flags(2) + count(2) + overflow(4) = 16 bytes
@@ -252,22 +280,171 @@ impl ElemRef {
     }
 
     fn leaf_flags(&self) -> Option<u32> {
-        if !self.is_leaf() {
+        let data = self.data.as_ref()?;
+        let elem_offset = 16 + self.index * 16;
+        if elem_offset + 16 > data.len() {
             return None;
         }
-        let elems = self.page.leaf_elements();
-        elems.get(self.index).map(|e| e.flags)
+        Some(u32::from_le_bytes([data[elem_offset], data[elem_offset + 1],
+                                 data[elem_offset + 2], data[elem_offset + 3]]))
     }
 
     fn leaf_key_value(&self) -> Option<(Vec<u8>, Vec<u8>)> {
         let data = self.data.as_ref()?;
-        let elems = self.page.leaf_elements();
-        let elem = elems.get(self.index)?;
-        Some((elem.key(data).to_vec(), elem.value(data).to_vec()))
+        
+        // Element header: flags(4) + pos(4) + ksize(4) + vsize(4) = 16 bytes
+        let elem_offset = 16 + self.index * 16;  // 16 bytes for page header
+        if elem_offset + 16 > data.len() {
+            return None;
+        }
+        
+        // Read pos (absolute offset within page, relative to element header base)
+        let pos = u32::from_le_bytes([data[elem_offset + 4], data[elem_offset + 5],
+                                       data[elem_offset + 6], data[elem_offset + 7]]) as usize;
+        let ksize = u32::from_le_bytes([data[elem_offset + 8], data[elem_offset + 9],
+                                        data[elem_offset + 10], data[elem_offset + 11]]) as usize;
+        let vsize = u32::from_le_bytes([data[elem_offset + 12], data[elem_offset + 13],
+                                        data[elem_offset + 14], data[elem_offset + 15]]) as usize;
+        
+        // Go's bbolt: Key is at page_start + pos (absolute offset from page start)
+        // In our data, the page starts at index 0
+        let key_start = pos;
+        if key_start + ksize > data.len() {
+            return None;
+        }
+        let key = data[key_start..key_start + ksize].to_vec();
+        
+        // Value follows key (sequential within the data region)
+        let value_start = key_start + ksize;
+        if value_start + vsize > data.len() {
+            return None;
+        }
+        let value = data[value_start..value_start + vsize].to_vec();
+        
+        Some((key, value))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // TODO: Add cursor tests with a test database
+    use super::*;
+
+    /// Test cursor traversal on inline bucket data with 2 entries
+    #[test]
+    fn test_cursor_inline_traversal() {
+        // Simulate Go's inline bucket format:
+        // [InBucket header (16 bytes)][Page data]
+        // Page data: page_header(16) + elem0(16) + elem1(16) + key0 + val0 + key1 + val1
+        
+        let key0 = b"key1";
+        let val0 = b"value1";
+        let key1 = b"key3";
+        let val1 = b"value3";
+        
+        let page_size = 4096;
+        let mut data = vec![0u8; page_size];
+        
+        // Page header at offset 0 (16 bytes)
+        data[0..8].copy_from_slice(&0u64.to_le_bytes()); // id
+        data[8..10].copy_from_slice(&2u16.to_le_bytes()); // flags = LEAF_PAGE_FLAG
+        data[10..12].copy_from_slice(&2u16.to_le_bytes()); // count = 2
+        data[12..16].copy_from_slice(&0u32.to_le_bytes()); // overflow
+        
+        // Element headers start at offset 16
+        let elem0_offset = 16usize;
+        let elem1_offset = 32usize;
+        
+        // Calculate data offsets (sequential, starting after element headers)
+        let data_start = elem1_offset + 16; // After elem1 header
+        
+        // Elem 0 header
+        data[elem0_offset..elem0_offset + 4].copy_from_slice(&0u32.to_le_bytes()); // flags
+        data[elem0_offset + 4..elem0_offset + 8].copy_from_slice(&(data_start as u32).to_le_bytes()); // pos
+        data[elem0_offset + 8..elem0_offset + 12].copy_from_slice(&(key0.len() as u32).to_le_bytes()); // ksize
+        data[elem0_offset + 12..elem0_offset + 16].copy_from_slice(&(val0.len() as u32).to_le_bytes()); // vsize
+        
+        // Elem 1 header - pos points to next sequential data
+        let data1_start = data_start + key0.len() + val0.len();
+        data[elem1_offset..elem1_offset + 4].copy_from_slice(&0u32.to_le_bytes()); // flags
+        data[elem1_offset + 4..elem1_offset + 8].copy_from_slice(&(data1_start as u32).to_le_bytes()); // pos
+        data[elem1_offset + 8..elem1_offset + 12].copy_from_slice(&(key1.len() as u32).to_le_bytes()); // ksize
+        data[elem1_offset + 12..elem1_offset + 16].copy_from_slice(&(val1.len() as u32).to_le_bytes()); // vsize
+        
+        // Key-value data
+        data[data_start..data_start + key0.len()].copy_from_slice(key0);
+        data[data_start + key0.len()..data_start + key0.len() + val0.len()].copy_from_slice(val0);
+        data[data1_start..data1_start + key1.len()].copy_from_slice(key1);
+        data[data1_start + key1.len()..data1_start + key1.len() + val1.len()].copy_from_slice(val1);
+        
+        // Create cursor with inline data (without InBucket header)
+        let mut cursor = Cursor::new();
+        cursor.set_inline_data(data);
+        
+        // Verify count
+        assert_eq!(cursor.stack_len(), 1, "Should have 1 ElemRef");
+        assert_eq!(cursor.current_index(), Some(0), "Index should start at 0");
+        
+        // Get first entry - use key_value() since db is not set
+        let first = cursor.key_value();
+        assert!(first.is_some(), "key_value() should return Some");
+        let (k, v) = first.unwrap();
+        assert_eq!(&k, key0, "First key should be 'key1'");
+        assert_eq!(&v, val0, "First value should be 'value1'");
+        assert_eq!(cursor.current_index(), Some(0), "Index should still be 0 after key_value()");
+        
+        // Get next entry
+        let second = cursor.next();
+        assert!(second.is_some(), "next() should return Some for second entry");
+        let (k, v) = second.unwrap();
+        assert_eq!(&k, key1, "Second key should be 'key3'");
+        assert_eq!(&v, val1, "Second value should be 'value3'");
+        
+        // Get next - should return None
+        let third = cursor.next();
+        assert!(third.is_none(), "next() should return None after last entry");
+        
+        println!("Cursor inline traversal test passed!");
+    }
+
+    /// Test cursor with data that uses pos offset (not sequential from header)
+    #[test]
+    fn test_cursor_uses_pos_offset() {
+        // Create page data where elements use pos offset
+        let key = b"testkey";
+        let val = b"testval";
+        
+        let page_size = 4096;
+        let mut data = vec![0u8; page_size];
+        
+        // Page header
+        data[0..8].copy_from_slice(&0u64.to_le_bytes());
+        data[8..10].copy_from_slice(&2u16.to_le_bytes()); // LEAF_PAGE_FLAG
+        data[10..12].copy_from_slice(&1u16.to_le_bytes()); // count = 1
+        data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        
+        // Element header at offset 16
+        let elem_offset = 16usize;
+        let data_offset = 256usize; // Key is stored far from header
+        
+        data[elem_offset..elem_offset + 4].copy_from_slice(&0u32.to_le_bytes()); // flags
+        data[elem_offset + 4..elem_offset + 8].copy_from_slice(&(data_offset as u32).to_le_bytes()); // pos
+        data[elem_offset + 8..elem_offset + 12].copy_from_slice(&(key.len() as u32).to_le_bytes());
+        data[elem_offset + 12..elem_offset + 16].copy_from_slice(&(val.len() as u32).to_le_bytes());
+        
+        // Key-value data at offset 256
+        data[data_offset..data_offset + key.len()].copy_from_slice(key);
+        data[data_offset + key.len()..data_offset + key.len() + val.len()].copy_from_slice(val);
+        
+        // Test cursor
+        let mut cursor = Cursor::new();
+        cursor.set_inline_data(data);
+        
+        let result = cursor.key_value();
+        assert!(result.is_some(), "key_value() should return Some");
+        let (k, v) = result.unwrap();
+        assert_eq!(&k, key, "Key should be 'testkey'");
+        assert_eq!(&v, val, "Value should be 'testval'");
+        
+        println!("Cursor pos offset test passed!");
+    }
 }

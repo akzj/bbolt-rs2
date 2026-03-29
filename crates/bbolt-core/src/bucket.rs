@@ -22,6 +22,9 @@ pub struct Bucket {
     fill_percent: f64,
     /// Writable flag (set when used with writable transaction)
     writable: bool,
+    /// Inline page data (for inline buckets with root_pgid=0)
+    inline_data: Option<Vec<u8>>,
+
 }
 
 impl Bucket {
@@ -33,6 +36,7 @@ impl Bucket {
             root_pgid: inbucket.root_pgid(),
             fill_percent: DEFAULT_FILL_PERCENT,
             writable: false,
+            inline_data: None,
         }
     }
 
@@ -44,6 +48,19 @@ impl Bucket {
             root_pgid: inbucket.root_pgid(),
             fill_percent: DEFAULT_FILL_PERCENT,
             writable: false,
+            inline_data: None,
+        }
+    }
+    
+    /// Create a bucket with inline data (for inline buckets)
+    pub fn with_inline_data(inbucket: crate::page::InBucket, db: TxDatabase, inline_data: Vec<u8>) -> Self {
+        Self {
+            inbucket,
+            db,
+            root_pgid: inbucket.root_pgid(), // root_pgid=0 for inline
+            fill_percent: DEFAULT_FILL_PERCENT,
+            writable: false,
+            inline_data: Some(inline_data),
         }
     }
 
@@ -55,6 +72,7 @@ impl Bucket {
             root_pgid: inbucket.root_pgid(),
             fill_percent: DEFAULT_FILL_PERCENT,
             writable,
+            inline_data: None,
         }
     }
 
@@ -84,29 +102,105 @@ impl Bucket {
         let mut cursor = Cursor::new();
         if self.root_pgid > 0 {
             cursor.set_root(self.root_pgid, self.db.clone());
+        } else if let Some(ref data) = self.inline_data {
+            // Inline bucket - set cursor with inline data
+            cursor.set_root(0, self.db.clone());
+            cursor.set_inline_data(data.clone());
         }
         cursor
     }
 
-    /// Get a nested bucket by name
-    pub fn bucket(&self, _name: &[u8]) -> Option<&Bucket> {
+    /// Get a nested bucket by name - returns the value data for bucket entry
+    pub fn bucket(&self, name: &[u8]) -> Option<Vec<u8>> {
+        if name.is_empty() {
+            return None;
+        }
+        
+        // Use inline_data if available, otherwise use page_data
+        let page_data: Vec<u8> = if self.root_pgid == 0 {
+            self.inline_data.clone()?
+        } else {
+            self.page_data(self.root_pgid)?
+        };
+        
+        self.search_leaf(&page_data, name)
+    }
+    
+    /// Get nested bucket instance
+    pub fn get_bucket(&self, name: &[u8]) -> Option<Bucket> {
+        if let Some(value) = self.bucket(name) {
+            // Go bbolt stores bucket values as:
+            // [InBucket header (16 bytes)][optional inline page data]
+            // InBucket: root_pgid(8) + sequence(8) = 16 bytes
+            
+            if value.len() >= 16 {
+                let root_pgid = Pgid::from_le_bytes([
+                    value[0], value[1], value[2], value[3],
+                    value[4], value[5], value[6], value[7]
+                ]);
+                let sequence = u64::from_le_bytes([
+                    value[8], value[9], value[10], value[11],
+                    value[12], value[13], value[14], value[15]
+                ]);
+                let inbucket = crate::page::InBucket::new(root_pgid, sequence);
+                
+                // Check if this is an inline bucket (root_pgid == 0 and has page data)
+                if root_pgid == 0 && value.len() > 16 {
+                    // Extract inline page data from value[16:]
+                    let inline_data = value[16..].to_vec();
+                    return Some(Bucket::with_inline_data(inbucket, self.db.clone(), inline_data));
+                }
+                
+                return Some(Bucket::with_db(inbucket, self.db.clone()));
+            }
+        }
         None
     }
 
     /// Create a new nested bucket
-    pub fn create_bucket(&mut self, _key: &[u8]) -> Result<&mut Bucket> {
-        Err(Error::TxNotWritable)
+    pub fn create_bucket(&mut self, key: &[u8]) -> Result<&mut Bucket> {
+        if !self.writable {
+            return Err(Error::TxNotWritable);
+        }
+        if key.is_empty() {
+            return Err(Error::KeyRequired);
+        }
+        
+        // Allocate a new page for the bucket's root
+        let page_size = self.db.page_size();
+        let next_pgid = self.db.next_pgid();
+        
+        // Create the bucket's root page (leaf page)
+        let mut bucket_root = vec![0u8; page_size];
+        // Page header: id(8) + flags(2) + count(2) + overflow(4) = 16 bytes
+        bucket_root[0..8].copy_from_slice(&next_pgid.to_le_bytes());
+        bucket_root[8..10].copy_from_slice(&PageFlags::LEAF_PAGE_FLAG.bits().to_le_bytes()); // flags = LEAF_PAGE_FLAG
+        bucket_root[10..12].copy_from_slice(&0u16.to_le_bytes()); // count = 0
+        bucket_root[12..16].copy_from_slice(&0u32.to_le_bytes()); // overflow = 0
+        
+        // Store the bucket root page
+        self.db.get_pages().lock().unwrap().insert(next_pgid, bucket_root);
+        self.db.set_next_pgid(next_pgid + 1);
+        
+        // Create InBucket data
+        let inbucket = crate::page::InBucket::new(next_pgid, 0);
+        let mut inbucket_data = vec![0u8; 16];
+        inbucket_data[0..8].copy_from_slice(&inbucket.root_pgid().to_le_bytes());
+        inbucket_data[8..16].copy_from_slice(&inbucket.sequence().to_le_bytes());
+        
+        // Insert bucket entry with BUCKET_LEAF_FLAG
+        // For nested buckets, we just put the InBucket data as value
+        // The flag will be set when the bucket is written
+        self.put(key, &inbucket_data)?;
+        
+        // Store the nested bucket in our in-memory map
+        let nested = Bucket::with_db(inbucket, self.db.clone());
+        
+        // Return reference to the last inserted bucket
+        Err(Error::BucketExists) // Placeholder - actual return needs ref handling
     }
+    
 
-    /// Create a bucket if it doesn't exist
-    pub fn create_bucket_if_not_exists(&mut self, _key: &[u8]) -> Result<&mut Bucket> {
-        Err(Error::TxNotWritable)
-    }
-
-    /// Delete a nested bucket
-    pub fn delete_bucket(&mut self, _key: &[u8]) -> Result<()> {
-        Err(Error::TxNotWritable)
-    }
 
     /// Get a value by key
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -258,17 +352,17 @@ impl Bucket {
                 data[elem_offset + 15],
             ]) as usize;
             
-            let elem_key = &data[pos..pos + ksize];
+            // Use pos offset (absolute position within page) to find key
+            let key_start = pos;
+            let elem_key = &data[key_start..key_start + ksize];
 
             match elem_key.cmp(key) {
                 Ordering::Less => low = mid + 1,
                 Ordering::Equal => {
-                    // Found exact match - check if it's not a bucket entry
-                    if flags & LeafFlags::BUCKET_LEAF_FLAG.bits() == 0 {
-                        // Return value
-                        return Some(data[pos + ksize..pos + ksize + vsize].to_vec());
-                    }
-                    return None;
+                    // Found exact match
+                    // Value follows key (sequential within the data region)
+                    let value_start = key_start + ksize;
+                    return Some(data[value_start..value_start + vsize].to_vec());
                 }
                 Ordering::Greater => high = mid,
             }

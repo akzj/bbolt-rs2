@@ -76,7 +76,21 @@ impl Tx {
         self.root.cursor()
     }
 
+    /// Get a bucket by name (empty name returns root bucket)
+    pub fn bucket(&self, name: &[u8]) -> Option<Bucket> {
+        if name.is_empty() {
+            Some(Bucket::with_db(*self.meta.root(), self.db.clone()))
+        } else {
+            self.root.get_bucket(name)
+        }
+    }
+
     /// Get a value from the root bucket
+    /// Get the database handle (for cursor debugging)
+    pub fn get_db(&self) -> TxDatabase {
+        self.db.clone()
+    }
+    
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.root.get(key)
     }
@@ -230,6 +244,8 @@ pub struct TxDatabase {
     data: std::sync::Mutex<Vec<u8>>,
     /// Dirty pages managed by this transaction
     pages: std::sync::Arc<std::sync::Mutex<HashMap<Pgid, Vec<u8>>>>,
+    /// Next available page ID
+    next_pgid: Pgid,
 }
 
 impl Clone for TxDatabase {
@@ -239,6 +255,7 @@ impl Clone for TxDatabase {
             meta: self.meta,
             data: std::sync::Mutex::new(self.data.lock().unwrap().clone()),
             pages: self.pages.clone(),
+            next_pgid: self.next_pgid,
         }
     }
 }
@@ -247,7 +264,19 @@ impl TxDatabase {
     /// Create from existing database
     pub fn new(page_size: usize, meta: Meta, data: Vec<u8>) -> Self {
         let pages = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
-        Self { page_size, meta, data: std::sync::Mutex::new(data), pages }
+        let next_pgid = meta.pgid.max(4); // Start from page 4 (0=meta0, 1=meta1, 2=freelist, 3=root)
+        Self { page_size, meta, data: std::sync::Mutex::new(data), pages, next_pgid }
+    }
+    
+
+    /// Get the next available page ID
+    pub fn next_pgid(&self) -> Pgid {
+        self.next_pgid
+    }
+    
+    /// Set the next available page ID
+    pub fn set_next_pgid(&mut self, pgid: Pgid) {
+        self.next_pgid = pgid;
     }
     
     /// Get the pages Arc
