@@ -7,6 +7,40 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
+/// Global freelist storage for cross-transaction persistence
+static GLOBAL_FREELIST: FreelistStore = FreelistStore::new();
+
+/// Thread-safe freelist storage
+struct FreelistStore {
+    pages: Mutex<Vec<Pgid>>,
+}
+
+impl FreelistStore {
+    pub const fn new() -> Self {
+        Self {
+            pages: Mutex::new(Vec::new()),
+        }
+    }
+    
+    /// Store free pages
+    pub fn store(&self, free_pages: Vec<Pgid>) {
+        let mut pages = free_pages;
+        pages.sort();
+        pages.reverse();
+        *self.pages.lock().unwrap() = pages;
+    }
+    
+    /// Load free pages
+    pub fn load(&self) -> Vec<Pgid> {
+        self.pages.lock().unwrap().clone()
+    }
+    
+    /// Get page IDs
+    pub fn get_page_ids(&self) -> Vec<Pgid> {
+        self.pages.lock().unwrap().clone()
+    }
+}
+
 
 use crate::constants::*;
 use crate::errors::{Error, Result};
@@ -281,7 +315,27 @@ impl Db {
         // Read meta1
         let meta1 = Self::read_meta(&data[page_size..page_size * 2], 1)?;
 
+        // Read freelist if exists
+        let freelist_pgid = meta0.freelist;
+        if freelist_pgid > 0 && freelist_pgid != Pgid::MAX {
+            let freelist_offset = freelist_pgid as usize * page_size;
+            if freelist_offset + page_size <= data.len() {
+                let freelist_page = Self::read_page(&data[freelist_offset..freelist_offset + page_size]);
+                let mut freelist = Freelist::new();
+                freelist.read(&freelist_page, &data[freelist_offset..freelist_offset + page_size]);
+                // Store freelist in global storage
+                GLOBAL_FREELIST.store(freelist.get_free_pages());
+            }
+        }
+
         Ok((data, meta0, meta1))
+    }
+    
+    /// Read a page from buffer
+    fn read_page(buf: &[u8]) -> Page {
+        use std::ptr;
+        let ptr = buf.as_ptr() as *const Page;
+        unsafe { ptr::read_unaligned(ptr) }
     }
 
     /// Read a meta page from buffer

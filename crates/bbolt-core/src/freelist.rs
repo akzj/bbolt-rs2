@@ -76,6 +76,11 @@ impl Freelist {
     pub fn free_count(&self) -> usize {
         self.free.len()
     }
+    
+    /// Get the free pages vector
+    pub fn get_free_pages(&self) -> Vec<Pgid> {
+        self.free.clone()
+    }
 
     /// Get the number of pending pages
     pub fn pending_count(&self) -> usize {

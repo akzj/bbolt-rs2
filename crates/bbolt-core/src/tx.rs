@@ -183,6 +183,7 @@ impl Tx {
 }
 
 /// Clone-able database handle for transactions
+#[derive(Debug)]
 pub struct TxDatabase {
     page_size: usize,
     meta: Meta,
