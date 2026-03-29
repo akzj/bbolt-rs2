@@ -8,10 +8,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Global freelist storage for cross-transaction persistence
-static GLOBAL_FREELIST: FreelistStore = FreelistStore::new();
+pub static GLOBAL_FREELIST: FreelistStore = FreelistStore::new();
 
 /// Thread-safe freelist storage
-struct FreelistStore {
+pub struct FreelistStore {
     pages: Mutex<Vec<Pgid>>,
 }
 

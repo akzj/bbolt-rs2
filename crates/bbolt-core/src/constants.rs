@@ -6,6 +6,9 @@ pub const MAGIC: u32 = 0xED0CDAED;
 /// Database format version
 pub const VERSION: u32 = 2;
 
+/// Freelist page type flag
+pub const FREELIST_PAGE_FLAG: u16 = 0x10;
+
 /// Page header size in bytes
 pub const PAGE_HEADER_SIZE: u64 = 16;
 

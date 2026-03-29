@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::bucket::Bucket;
+use crate::constants::*;
 use crate::errors::{Error, Result};
 use crate::page::{Meta, Page, Pgid, Txid};
 
@@ -173,6 +174,45 @@ impl Tx {
                 self.db.write_page(pgid, data)?;
             }
         }
+        // Write freelist to its dedicated page
+        self.write_freelist()?;
+        Ok(())
+    }
+
+    /// Write freelist to its dedicated page
+    fn write_freelist(&self) -> Result<()> {
+        let freelist = crate::db::GLOBAL_FREELIST.load();
+        let freelist_ids: Vec<Pgid> = freelist.iter().cloned().collect();
+        eprintln!("DEBUG write_freelist: {} free pages to persist", freelist_ids.len());
+        
+        // Allocate a page for freelist if needed (use page 2, freelist_pgid)
+        let freelist_pgid = self.meta.freelist_pgid();
+        if freelist_pgid == Pgid::MAX {
+            return Ok(()); // No freelist page yet
+        }
+        
+        // Create freelist page data
+        let page_size = self.db.page_size();
+        let mut page_data = vec![0u8; page_size];
+        
+        // Write page header
+        let page_ptr = page_data.as_mut_ptr() as *mut Page;
+        unsafe {
+            (*page_ptr).id = freelist_pgid;
+            (*page_ptr).flags = FREELIST_PAGE_FLAG;
+            (*page_ptr).count = freelist_ids.len() as u16;
+            (*page_ptr).overflow = 0;
+        }
+        
+        // Write freelist IDs after header
+        let header_size = PAGE_HEADER_SIZE as usize;
+        let ids_ptr = page_data[header_size..].as_mut_ptr() as *mut Pgid;
+        for (i, &id) in freelist_ids.iter().enumerate() {
+            unsafe { ids_ptr.add(i).write(id) };
+        }
+        
+        self.db.write_page(freelist_pgid, &page_data)?;
+        eprintln!("DEBUG write_freelist: wrote {} IDs to page {}", freelist_ids.len(), freelist_pgid);
         Ok(())
     }
 
