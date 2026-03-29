@@ -624,3 +624,78 @@ mod cross_test {
         println!("Run: cd /tmp/bbolt-cross-test && go run test_rust_db.go");
     }
 }
+
+#[cfg(test)]
+mod go_read_tests {
+    use super::*;
+    
+    #[test]
+    fn test_read_go_written_bucket() {
+        // This test reads a database created by Go bbolt
+        // The Go test script created bucket "test" with key1=value1_updated and key3=value3
+        let path = std::path::Path::new("/tmp/gotest/cross_test.db");
+        
+        if !path.exists() {
+            println!("Skipping: /tmp/gotest/cross_test.db not found. Run Go test first.");
+            return;
+        }
+        
+        let db = Db::open(path, Options::default()).unwrap();
+        
+        // Begin read transaction
+        // For inline bucket, the value contains an inline page
+        // We need to parse it to verify the content
+        
+        // Read root page directly
+        let meta = db.meta();
+        let root_pgid = meta.root().root_pgid();
+        let root_data = db.page_data(root_pgid).unwrap();
+        
+        // Get bucket entry
+        let count = u16::from_le_bytes([root_data[10], root_data[11]]) as usize;
+        assert_eq!(count, 1, "Root page should have 1 entry");
+        
+        let elem_start = 16usize;
+        let ksize = u32::from_le_bytes([root_data[elem_start+8], root_data[elem_start+9], root_data[elem_start+10], root_data[elem_start+11]]) as usize;
+        let vsize = u32::from_le_bytes([root_data[elem_start+12], root_data[elem_start+13], root_data[elem_start+14], root_data[elem_start+15]]) as usize;
+        
+        let key_off = elem_start + 16;
+        assert_eq!(&root_data[key_off..key_off + ksize], b"test", "Bucket key should be 'test'");
+        
+        // Parse inline bucket value
+        let value_off = key_off + ksize;
+        let value = &root_data[value_off..value_off + vsize];
+        
+        let bucket_header_size = 16usize;
+        let inline_count = u16::from_le_bytes([value[bucket_header_size+10], value[bucket_header_size+11]]) as usize;
+        assert_eq!(inline_count, 2, "Inline bucket should have 2 entries");
+        
+        // Verify key1=value1_updated
+        // For element j: data is at bucket_header_size + 16 (page header) + 16*count + sum(prev sizes)
+        let elem_area_size = 16 * inline_count;
+        let data_start = bucket_header_size + 16 + elem_area_size;
+        
+        // Elem 0
+        let e0_off = bucket_header_size + 16;
+        let e0_ks = u32::from_le_bytes([value[e0_off+8], value[e0_off+9], value[e0_off+10], value[e0_off+11]]) as usize;
+        let e0_vs = u32::from_le_bytes([value[e0_off+12], value[e0_off+13], value[e0_off+14], value[e0_off+15]]) as usize;
+        let e0_key = &value[data_start..data_start + e0_ks];
+        let e0_val = &value[data_start + e0_ks..data_start + e0_ks + e0_vs];
+        assert_eq!(e0_key, b"key1", "First key should be 'key1'");
+        assert_eq!(e0_val, b"value1_updated", "First value should be 'value1_updated'");
+        
+        // Elem 1
+        let prev_size = e0_ks + e0_vs;
+        let e1_off = bucket_header_size + 16 + 16;
+        let e1_ks = u32::from_le_bytes([value[e1_off+8], value[e1_off+9], value[e1_off+10], value[e1_off+11]]) as usize;
+        let e1_vs = u32::from_le_bytes([value[e1_off+12], value[e1_off+13], value[e1_off+14], value[e1_off+15]]) as usize;
+        let e1_key = &value[data_start + prev_size..data_start + prev_size + e1_ks];
+        let e1_val = &value[data_start + prev_size + e1_ks..data_start + prev_size + e1_ks + e1_vs];
+        assert_eq!(e1_key, b"key3", "Second key should be 'key3'");
+        assert_eq!(e1_val, b"value3", "Second value should be 'value3'");
+        
+        db.close().unwrap();
+        
+        println!("Successfully read Go-written bucket with key1=value1_updated and key3=value3");
+    }
+}
