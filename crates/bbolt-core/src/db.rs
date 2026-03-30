@@ -644,6 +644,31 @@ impl Db {
         Ok(())
     }
 
+    /// Grow the database file to the specified size.
+    /// If the current file size is already >= size, this does nothing.
+    /// This is used internally when writing beyond the current file size.
+    pub fn grow(&self, size: usize) -> Result<()> {
+        // Ignore if already at or above target size
+        let metadata = self.file.read().unwrap().metadata()?;
+        let current_size = metadata.len() as usize;
+        
+        if size <= current_size {
+            return Ok(());
+        }
+        
+        // For read-only databases, we cannot grow
+        if self.read_only {
+            return Err(Error::TxNotWritable);
+        }
+        
+        // Truncate file to new size
+        let mut file = self.file.write().unwrap();
+        file.set_len(size as u64)?;
+        file.sync_all()?;
+        
+        Ok(())
+    }
+
     /// Check performs a consistency check on the database.
     /// It traverses all pages and verifies checksums.
     /// Returns Ok(()) if no errors found, or Err with diagnostic info.
@@ -1189,5 +1214,36 @@ mod go_read_tests {
         db.close().unwrap();
         
         println!("Successfully read Go-written bucket with key1=value1_updated and key3=value3");
+    }
+
+    #[test]
+    fn test_db_grow() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join("test_grow.db");
+        
+        // Create a small database
+        let db = Db::open(&db_path, Options::default()).unwrap();
+        
+        // Get initial file size
+        let metadata = std::fs::metadata(&db_path).unwrap();
+        let initial_size = metadata.len() as usize;
+        
+        // Grow the database
+        let new_size = initial_size + 8192;
+        db.grow(new_size).unwrap();
+        
+        // Verify file grew
+        let metadata = std::fs::metadata(&db_path).unwrap();
+        assert_eq!(metadata.len() as usize, new_size);
+        
+        // Grow to smaller size - should be no-op
+        db.grow(1000).unwrap();
+        
+        // Size should still be new_size
+        let metadata = std::fs::metadata(&db_path).unwrap();
+        assert_eq!(metadata.len() as usize, new_size);
+        
+        db.close().unwrap();
+        std::fs::remove_file(&db_path).ok();
     }
 }
