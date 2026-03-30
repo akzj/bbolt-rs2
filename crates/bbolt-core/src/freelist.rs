@@ -8,6 +8,30 @@ use std::collections::HashMap;
 use crate::constants::*;
 use crate::page::{Page, Pgid, Txid};
 
+/// FreelistType determines the backend freelist implementation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreelistType {
+    /// ArrayFreelist - simple array-based freelist
+    Array = 0,
+    /// HashMapFreelist - hashmap-based freelist for better concurrent access
+    HashMap = 1,
+}
+
+impl Default for FreelistType {
+    fn default() -> Self {
+        FreelistType::Array
+    }
+}
+
+impl std::fmt::Display for FreelistType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FreelistType::Array => write!(f, "array"),
+            FreelistType::HashMap => write!(f, "hashmap"),
+        }
+    }
+}
+
 /// Freelist tracks free and pending pages
 pub struct Freelist {
     /// Free page IDs
@@ -16,16 +40,29 @@ pub struct Freelist {
     pending: HashMap<Txid, Vec<Pgid>>,
     /// Read-only transaction IDs
     readonly_txs: Vec<Txid>,
+    /// Freelist type
+    freelist_type: FreelistType,
 }
 
 impl Freelist {
-    /// Create a new empty freelist
+    /// Create a new empty freelist with default type (Array)
     pub fn new() -> Self {
+        Self::with_type(FreelistType::default())
+    }
+
+    /// Create a new empty freelist with specified type
+    pub fn with_type(freelist_type: FreelistType) -> Self {
         Self {
             free: Vec::new(),
             pending: HashMap::new(),
             readonly_txs: Vec::new(),
+            freelist_type,
         }
+    }
+
+    /// Get the freelist type
+    pub fn freelist_type(&self) -> FreelistType {
+        self.freelist_type
     }
 
     /// Read freelist from a page and data buffer
