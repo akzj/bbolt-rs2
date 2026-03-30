@@ -36,7 +36,7 @@ pub mod page;
 pub mod tx;
 
 // Re-exports
-pub use bucket::Bucket;
+pub use bucket::{Bucket, BucketStats};
 pub use constants::{LeafFlags, PageFlags};
 pub use cursor::Cursor;
 pub use db::{Db, DbInfo, Options, Stats};

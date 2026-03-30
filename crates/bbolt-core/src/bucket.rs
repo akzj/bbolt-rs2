@@ -24,7 +24,37 @@ pub struct Bucket {
     writable: bool,
     /// Inline page data (for inline buckets with root_pgid=0)
     inline_data: Option<Vec<u8>>,
+}
 
+/// BucketStats records statistics about resources used by a bucket.
+#[derive(Debug, Default, Clone)]
+pub struct BucketStats {
+    /// Number of logical branch pages
+    pub branch_page_count: usize,
+    /// Number of physical branch overflow pages
+    pub branch_overflow_count: usize,
+    /// Number of logical leaf pages
+    pub leaf_page_count: usize,
+    /// Number of physical leaf overflow pages
+    pub leaf_overflow_count: usize,
+    /// Number of keys/value pairs
+    pub key_count: usize,
+    /// Number of levels in B+tree
+    pub depth: usize,
+    /// Bytes allocated for physical branch pages
+    pub branch_alloc: usize,
+    /// Bytes actually used for branch data
+    pub branch_inuse: usize,
+    /// Bytes allocated for physical leaf pages
+    pub leaf_alloc: usize,
+    /// Bytes actually used for leaf data
+    pub leaf_inuse: usize,
+    /// Total number of buckets including the top bucket
+    pub bucket_count: usize,
+    /// Total number of inline buckets
+    pub inline_bucket_count: usize,
+    /// Bytes used for inline buckets
+    pub inline_bucket_inuse: usize,
 }
 
 impl Bucket {
@@ -828,6 +858,183 @@ impl Bucket {
         self.inbucket = inbucket;
         self.root_pgid = inbucket.root_pgid();
     }
+
+    /// Stats returns statistics about the bucket.
+    pub fn stats(&self) -> BucketStats {
+        let mut s = BucketStats::default();
+        let page_size = self.db.page_size();
+        
+        s.bucket_count += 1;
+        if self.root_pgid == 0 {
+            s.inline_bucket_count += 1;
+        }
+        
+        // Traverse all pages in this bucket
+        self.for_each_page(|page_data, depth, is_leaf, overflow| {
+            if is_leaf {
+                // Count keys
+                if page_data.len() >= 16 {
+                    let count = u16::from_le_bytes([page_data[10], page_data[11]]) as usize;
+                    s.key_count += count;
+                }
+                
+                // Calculate used bytes
+                let mut used = 16; // Page header
+                if page_data.len() >= 16 {
+                    let count = u16::from_le_bytes([page_data[10], page_data[11]]) as usize;
+                    if count > 0 {
+                        // Element headers
+                        used += 16 * count;
+                        
+                        // Data: use last element's position + sizes
+                        let elem_start = 16 + (count - 1) * 16;
+                        if elem_start + 16 <= page_data.len() {
+                            let pos = u32::from_le_bytes([
+                                page_data[elem_start + 4],
+                                page_data[elem_start + 5],
+                                page_data[elem_start + 6],
+                                page_data[elem_start + 7],
+                            ]) as usize;
+                            let ksize = u32::from_le_bytes([
+                                page_data[elem_start + 8],
+                                page_data[elem_start + 9],
+                                page_data[elem_start + 10],
+                                page_data[elem_start + 11],
+                            ]) as usize;
+                            let vsize = u32::from_le_bytes([
+                                page_data[elem_start + 12],
+                                page_data[elem_start + 13],
+                                page_data[elem_start + 14],
+                                page_data[elem_start + 15],
+                            ]) as usize;
+                            used = pos + ksize + vsize + 16; // +16 for last element header
+                        }
+                    }
+                }
+                
+                if self.root_pgid == 0 {
+                    s.inline_bucket_inuse += used;
+                } else {
+                    s.leaf_page_count += 1;
+                    s.leaf_inuse += used;
+                    s.leaf_overflow_count += overflow;
+                }
+            } else {
+                // Branch page
+                s.branch_page_count += 1;
+                let mut used = 16; // Page header
+                if page_data.len() >= 16 {
+                    let count = u16::from_le_bytes([page_data[10], page_data[11]]) as usize;
+                    if count > 0 {
+                        used += 16 * count;
+                        let elem_start = 16 + (count - 1) * 16;
+                        if elem_start + 16 <= page_data.len() {
+                            let pos = u32::from_le_bytes([
+                                page_data[elem_start + 4],
+                                page_data[elem_start + 5],
+                                page_data[elem_start + 6],
+                                page_data[elem_start + 7],
+                            ]) as usize;
+                            let ksize = u32::from_le_bytes([
+                                page_data[elem_start + 8],
+                                page_data[elem_start + 9],
+                                page_data[elem_start + 10],
+                                page_data[elem_start + 11],
+                            ]) as usize;
+                            used = pos + ksize + 16; // +16 for last element header
+                        }
+                    }
+                }
+                s.branch_inuse += used;
+                s.branch_overflow_count += overflow;
+            }
+            
+            // Track maximum depth
+            if depth + 1 > s.depth {
+                s.depth = depth + 1;
+            }
+        });
+        
+        s
+    }
+
+    /// Inspect returns a debug string representation of the bucket.
+    pub fn inspect(&self) -> String {
+        let stats = self.stats();
+        format!(
+            "Bucket {{\n  root_pgid: {},\n  depth: {},\n  key_count: {},\n  bucket_count: {},\n  leaf_pages: {},\n  branch_pages: {},\n  inline_buckets: {},\n  inline_bytes: {},\n  leaf_inuse: {},\n  branch_inuse: {},\n}}",
+            self.root_pgid,
+            stats.depth,
+            stats.key_count,
+            stats.bucket_count,
+            stats.leaf_page_count,
+            stats.branch_page_count,
+            stats.inline_bucket_count,
+            stats.inline_bucket_inuse,
+            stats.leaf_inuse,
+            stats.branch_inuse,
+        )
+    }
+
+    /// ForEachPage iterates over all pages in the bucket with a callback.
+    fn for_each_page<F>(&self, mut f: F)
+    where
+        F: FnMut(&[u8], usize, bool, usize),
+    {
+        if self.root_pgid == 0 {
+            // Inline bucket
+            if let Some(ref data) = self.inline_data {
+                f(data, 0, true, 0);
+            }
+            return;
+        }
+        
+        self._for_each_page(self.root_pgid, 0, &mut f);
+    }
+
+    fn _for_each_page<F>(&self, pgid: Pgid, depth: usize, f: &mut F)
+    where
+        F: FnMut(&[u8], usize, bool, usize),
+    {
+        let page_data = match self.page_data(pgid) {
+            Some(d) => d,
+            None => return,
+        };
+        
+        if page_data.len() < 16 {
+            return;
+        }
+        
+        let flags = u16::from_le_bytes([page_data[8], page_data[9]]);
+        let overflow = u32::from_le_bytes([page_data[12], page_data[13], page_data[14], page_data[15]]) as usize;
+        
+        let is_leaf = flags == PageFlags::LEAF_PAGE_FLAG.bits();
+        
+        // Call the callback
+        f(&page_data, depth, is_leaf, overflow);
+        
+        // Recursively traverse children for branch pages
+        if !is_leaf {
+            let count = u16::from_le_bytes([page_data[10], page_data[11]]) as usize;
+            for i in 0..count {
+                let elem_offset = 16 + i * 16;
+                if elem_offset + 16 > page_data.len() {
+                    break;
+                }
+                let child_pgid = u64::from_le_bytes([
+                    page_data[elem_offset + 8],
+                    page_data[elem_offset + 9],
+                    page_data[elem_offset + 10],
+                    page_data[elem_offset + 11],
+                    page_data[elem_offset + 12],
+                    page_data[elem_offset + 13],
+                    page_data[elem_offset + 14],
+                    page_data[elem_offset + 15],
+                ]);
+                self._for_each_page(child_pgid, depth + 1, f);
+            }
+        }
+    }
 }
 
 /// Meta placeholder for Bucket creation
@@ -1154,5 +1361,60 @@ mod tests {
         
         assert!(result.is_ok());
         assert_eq!(count, 0, "No buckets should be found");
+    }
+
+    // ============================================
+    // Tests for Bucket::stats() and Bucket::inspect()
+    // ============================================
+
+    #[test]
+    fn test_bucket_stats_empty() {
+        // Hypothesis: stats() on empty bucket should return valid stats structure
+        let bucket = create_test_bucket();
+        let stats = bucket.stats();
+        
+        assert_eq!(stats.key_count, 0, "Empty bucket should have 0 keys");
+        assert_eq!(stats.depth, 0, "Empty bucket should have depth 0");
+        assert_eq!(stats.bucket_count, 1, "Should count itself as 1 bucket");
+        assert_eq!(stats.inline_bucket_count, 1, "Empty bucket should be inline");
+    }
+
+    #[test]
+    fn test_bucket_stats_with_data() {
+        // Hypothesis: stats() should correctly count keys
+        let bucket = create_bucket_with_data();
+        let stats = bucket.stats();
+        
+        // create_bucket_with_data has 1 key ("key1")
+        assert_eq!(stats.key_count, 1, "Should have 1 key");
+        assert!(stats.depth >= 1, "Should have at least depth 1");
+    }
+
+    #[test]
+    fn test_bucket_inspect() {
+        // Hypothesis: inspect() should return a debug string representation
+        let bucket = create_test_bucket();
+        let output = bucket.inspect();
+        
+        // Verify it contains expected fields
+        assert!(output.contains("Bucket"), "Should contain 'Bucket'");
+        assert!(output.contains("root_pgid:"), "Should contain 'root_pgid:'");
+        assert!(output.contains("depth:"), "Should contain 'depth:'");
+        assert!(output.contains("key_count:"), "Should contain 'key_count:'");
+    }
+
+    #[test]
+    fn test_bucket_stats_writable() {
+        // Hypothesis: stats() on writable bucket with data should return correct counts
+        let mut bucket = create_writable_bucket();
+        
+        // Add some data
+        bucket.put(b"key1", b"value1").unwrap();
+        bucket.put(b"key2", b"value2").unwrap();
+        
+        let stats = bucket.stats();
+        
+        assert_eq!(stats.key_count, 2, "Should have 2 keys");
+        assert!(stats.leaf_page_count >= 1, "Should have at least 1 leaf page");
     }
 }
