@@ -31,6 +31,7 @@ pub mod cursor;
 pub mod db;
 pub mod errors;
 pub mod freelist;
+pub mod logger;
 pub mod node;
 pub mod page;
 pub mod platform;
@@ -43,6 +44,7 @@ pub use cursor::Cursor;
 pub use db::{Db, DbInfo, Options, Stats};
 pub use errors::{Error, Result};
 pub use freelist::Freelist;
+pub use logger::{DefaultLogger, DiscardLogger, Logger, SimpleLogger};
 pub use node::Node;
 pub use page::{
     BranchPageElement, InBucket, Inode, LeafPageElement, Meta, Page, PageInfo, Pgid, Txid,
