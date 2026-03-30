@@ -527,6 +527,16 @@ impl Db {
         Tx::begin(tx_db, writable)
     }
 
+    /// Begin a read-only transaction
+    pub fn begin_tx(&self) -> Result<Tx> {
+        self.begin(false)
+    }
+
+    /// Begin a read-write transaction
+    pub fn begin_rw_tx(&self) -> Result<Tx> {
+        self.begin(true)
+    }
+
     /// Update statistics
     pub fn update_stats(&self, stats: &Stats) {
         let mut current = self.stats.write().unwrap();
