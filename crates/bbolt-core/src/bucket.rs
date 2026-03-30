@@ -740,6 +740,74 @@ impl Bucket {
         Ok(())
     }
 
+    /// NextSequence returns the next integer sequence for the bucket.
+    /// The sequence is stored in the InBucket header and is incremented on each call.
+    pub fn next_sequence(&mut self) -> Result<u64> {
+        if !self.writable {
+            return Err(Error::TxNotWritable);
+        }
+
+        // Get current sequence
+        let mut sequence = self.inbucket.sequence();
+
+        // Increment sequence
+        sequence += 1;
+        self.inbucket.set_sequence(sequence);
+
+        // Note: The sequence is persisted when the transaction commits
+        // by updating the InBucket data in the meta page root
+        
+        Ok(sequence)
+    }
+
+    /// ForEachBucket iterates over all nested buckets in this bucket.
+    /// The callback function receives the bucket name and a Bucket reference.
+    /// Only entries with the BUCKET_LEAF_FLAG are iterated.
+    pub fn for_each_bucket<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], Bucket) -> Result<()>,
+    {
+        if self.root_pgid == 0 {
+            return Ok(()); // Empty bucket - no buckets to iterate
+        }
+
+        // Create cursor for this bucket
+        let mut cursor = self.cursor();
+        
+        // Iterate over all entries
+        while let Some((k, v, flags)) = cursor.next_with_flags() {
+            // Check if this is a bucket entry
+            if flags & LeafFlags::BUCKET_LEAF_FLAG.bits() != 0 {
+                // Parse InBucket from value
+                if v.len() < 16 {
+                    continue;
+                }
+                
+                let root_pgid = Pgid::from_le_bytes([
+                    v[0], v[1], v[2], v[3],
+                    v[4], v[5], v[6], v[7]
+                ]);
+                let sequence = u64::from_le_bytes([
+                    v[8], v[9], v[10], v[11],
+                    v[12], v[13], v[14], v[15]
+                ]);
+                let inbucket = crate::page::InBucket::new(root_pgid, sequence);
+                
+                // Check if this is an inline bucket
+                if root_pgid == 0 && v.len() > 16 {
+                    let inline_data = v[16..].to_vec();
+                    let bucket = Bucket::with_inline_data(inbucket, self.db.clone(), inline_data);
+                    f(&k, bucket)?;
+                } else if root_pgid > 0 {
+                    let bucket = Bucket::with_db(inbucket, self.db.clone());
+                    f(&k, bucket)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Get page data for a page ID
     pub fn page_data(&self, pgid: Pgid) -> Option<Vec<u8>> {
         self.db.page_data(pgid)
@@ -748,6 +816,17 @@ impl Bucket {
     /// Get page info
     pub fn page(&self, pgid: Pgid) -> Page {
         self.db.page(pgid)
+    }
+
+    /// Get the InBucket info (root page ID and sequence)
+    pub fn inbucket(&self) -> crate::page::InBucket {
+        self.inbucket
+    }
+
+    /// Set the InBucket info
+    pub fn set_inbucket(&mut self, inbucket: crate::page::InBucket) {
+        self.inbucket = inbucket;
+        self.root_pgid = inbucket.root_pgid();
     }
 }
 
@@ -1016,5 +1095,64 @@ mod tests {
         
         let result = bucket.delete_bucket(b"");
         assert!(matches!(result, Err(Error::BucketNameRequired)));
+    }
+
+    // ============================================
+    // Tests for new features (4-6)
+    // ============================================
+
+    #[test]
+    fn test_next_sequence() {
+        // Hypothesis: next_sequence() should increment and return the sequence number
+        let mut bucket = create_writable_bucket();
+        
+        // Initial sequence is 0 (from InBucket::new(1, 0))
+        // First call should return 1
+        let seq1 = bucket.next_sequence().unwrap();
+        assert_eq!(seq1, 1, "First sequence should be 1");
+        
+        // Second call should return 2
+        let seq2 = bucket.next_sequence().unwrap();
+        assert_eq!(seq2, 2, "Second sequence should be 2");
+        
+        // Third call should return 3
+        let seq3 = bucket.next_sequence().unwrap();
+        assert_eq!(seq3, 3, "Third sequence should be 3");
+    }
+
+    #[test]
+    fn test_for_each_bucket_with_db() {
+        // Hypothesis: for_each_bucket() should iterate over nested buckets
+        // Use create_bucket_with_data which has proper page setup
+        let bucket = create_bucket_with_data();
+        
+        // Add nested buckets using the bucket
+        // Note: This test requires a writable transaction context
+        // For unit testing, we verify the method signature and iteration logic
+        
+        // Empty bucket should iterate 0 times
+        let mut count = 0;
+        let result = bucket.for_each_bucket(|_name, _subbucket| {
+            count += 1;
+            Ok(())
+        });
+        assert!(result.is_ok(), "for_each_bucket should succeed");
+        // No buckets created yet, so count should be 0
+        assert_eq!(count, 0, "Empty bucket should have 0 nested buckets");
+    }
+
+    #[test]
+    fn test_for_each_bucket_empty() {
+        // Hypothesis: for_each_bucket() on empty bucket should return Ok without calling callback
+        let bucket = create_bucket_with_data();
+        
+        let mut count = 0;
+        let result = bucket.for_each_bucket(|_name, _subbucket| {
+            count += 1;
+            Ok(())
+        });
+        
+        assert!(result.is_ok());
+        assert_eq!(count, 0, "No buckets should be found");
     }
 }

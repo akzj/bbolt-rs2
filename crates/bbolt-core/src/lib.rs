@@ -39,7 +39,7 @@ pub mod tx;
 pub use bucket::Bucket;
 pub use constants::{LeafFlags, PageFlags};
 pub use cursor::Cursor;
-pub use db::{Db, Options, Stats};
+pub use db::{Db, DbInfo, Options, Stats};
 pub use errors::{Error, Result};
 pub use freelist::Freelist;
 pub use node::Node;

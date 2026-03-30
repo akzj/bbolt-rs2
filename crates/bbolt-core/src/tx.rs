@@ -175,17 +175,94 @@ impl Tx {
 
     /// Write dirty pages to the database
     fn write_pages(&mut self) -> Result<()> {
+        // Sync the root bucket's state to meta before writing
+        // This ensures any changes to root_pgid are persisted
+        self.meta.root = self.root.inbucket();
+        
+        // Get all dirty page IDs
         let pages = self.db.get_pages().lock().unwrap();
         let pgids: Vec<Pgid> = pages.keys().cloned().collect();
         drop(pages);
+        
+        // Write all dirty pages
         for pgid in pgids {
             let pages = self.db.get_pages().lock().unwrap();
             if let Some(data) = pages.get(&pgid) {
                 self.db.write_page(pgid, data)?;
             }
         }
+        
+        // Write updated meta pages (0 and 1)
+        self.write_meta_pages()?;
+        
         // Write freelist to its dedicated page
         self.write_freelist()?;
+        Ok(())
+    }
+    
+    /// Write meta pages with updated root bucket info
+    fn write_meta_pages(&self) -> Result<()> {
+        let page_size = self.db.page_size();
+        
+        // Create meta0 with txid = current txid
+        let mut meta0 = Meta::new(
+            page_size as u32,
+            self.meta.freelist_pgid(),
+            self.meta.root,
+            self.db.next_pgid(),
+            self.meta.txid().wrapping_add(1),
+        );
+        
+        // Create meta1 with txid = current txid - 1 (or keep current)
+        let mut meta1 = Meta::new(
+            page_size as u32,
+            self.meta.freelist_pgid(),
+            self.meta.root,
+            self.db.next_pgid(),
+            self.meta.txid(),
+        );
+        
+        // Serialize meta0 to page 0
+        let mut meta0_data = vec![0u8; page_size];
+        meta0_data[0..8].copy_from_slice(&0u64.to_le_bytes()); // page id
+        meta0_data[8..10].copy_from_slice(&PageFlags::META_PAGE_FLAG.bits().to_le_bytes());
+        meta0_data[10..12].copy_from_slice(&0u16.to_le_bytes());
+        meta0_data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        
+        let meta_offset = 16;
+        meta0_data[meta_offset..meta_offset + 4].copy_from_slice(&meta0.magic.to_le_bytes());
+        meta0_data[meta_offset + 4..meta_offset + 8].copy_from_slice(&meta0.version.to_le_bytes());
+        meta0_data[meta_offset + 8..meta_offset + 12].copy_from_slice(&meta0.page_size.to_le_bytes());
+        meta0_data[meta_offset + 12..meta_offset + 16].copy_from_slice(&meta0.flags.to_le_bytes());
+        meta0_data[meta_offset + 16..meta_offset + 24].copy_from_slice(&meta0.root.root.to_le_bytes());
+        meta0_data[meta_offset + 24..meta_offset + 32].copy_from_slice(&meta0.root.sequence.to_le_bytes());
+        meta0_data[meta_offset + 32..meta_offset + 40].copy_from_slice(&meta0.freelist.to_le_bytes());
+        meta0_data[meta_offset + 40..meta_offset + 48].copy_from_slice(&meta0.pgid.to_le_bytes());
+        meta0_data[meta_offset + 48..meta_offset + 56].copy_from_slice(&meta0.txid.to_le_bytes());
+        meta0_data[meta_offset + 56..meta_offset + 64].copy_from_slice(&meta0.checksum.to_le_bytes());
+        
+        self.db.write_page(0, &meta0_data)?;
+        
+        // Serialize meta1 to page 1
+        let mut meta1_data = vec![0u8; page_size];
+        meta1_data[0..8].copy_from_slice(&1u64.to_le_bytes()); // page id
+        meta1_data[8..10].copy_from_slice(&PageFlags::META_PAGE_FLAG.bits().to_le_bytes());
+        meta1_data[10..12].copy_from_slice(&0u16.to_le_bytes());
+        meta1_data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        
+        meta1_data[meta_offset..meta_offset + 4].copy_from_slice(&meta1.magic.to_le_bytes());
+        meta1_data[meta_offset + 4..meta_offset + 8].copy_from_slice(&meta1.version.to_le_bytes());
+        meta1_data[meta_offset + 8..meta_offset + 12].copy_from_slice(&meta1.page_size.to_le_bytes());
+        meta1_data[meta_offset + 12..meta_offset + 16].copy_from_slice(&meta1.flags.to_le_bytes());
+        meta1_data[meta_offset + 16..meta_offset + 24].copy_from_slice(&meta1.root.root.to_le_bytes());
+        meta1_data[meta_offset + 24..meta_offset + 32].copy_from_slice(&meta1.root.sequence.to_le_bytes());
+        meta1_data[meta_offset + 32..meta_offset + 40].copy_from_slice(&meta1.freelist.to_le_bytes());
+        meta1_data[meta_offset + 40..meta_offset + 48].copy_from_slice(&meta1.pgid.to_le_bytes());
+        meta1_data[meta_offset + 48..meta_offset + 56].copy_from_slice(&meta1.txid.to_le_bytes());
+        meta1_data[meta_offset + 56..meta_offset + 64].copy_from_slice(&meta1.checksum.to_le_bytes());
+        
+        self.db.write_page(1, &meta1_data)?;
+        
         Ok(())
     }
 
@@ -227,6 +304,11 @@ impl Tx {
     /// Get transaction stats
     pub fn stats(&self) -> &TxStats {
         &self.stats
+    }
+    
+    /// Get the meta page
+    pub fn meta(&self) -> &Meta {
+        &self.meta
     }
 }
 

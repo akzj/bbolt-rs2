@@ -5,6 +5,7 @@
 use std::cmp::Ordering;
 
 use crate::constants::*;
+use crate::errors::Result;
 use crate::page::{Page, Pgid};
 use crate::tx::TxDatabase;
 
@@ -435,6 +436,54 @@ impl Cursor {
         // The data already starts from the page header (InBucket header was stripped)
         // Create a synthetic ElemRef with the inline data
         self.stack.push(ElemRef::new_from_inline(0, data));
+    }
+
+    /// Delete the current key-value pair.
+    /// Requires a mutable reference to the bucket to perform the deletion.
+    /// Returns the deleted key if successful.
+    pub fn delete(&mut self, bucket: &mut crate::bucket::Bucket) -> Result<Option<Vec<u8>>> {
+        // Get current key
+        let current = self.key_value();
+        if current.is_none() {
+            return Ok(None);
+        }
+        
+        let (key, _value) = current.unwrap();
+        
+        // Use the bucket's delete method
+        bucket.delete(&key)?;
+        
+        // Reset cursor position after deletion
+        self.clear();
+        
+        Ok(Some(key))
+    }
+
+    /// Get the current key without consuming it
+    pub fn current_key(&self) -> Option<Vec<u8>> {
+        if self.stack.is_empty() {
+            return None;
+        }
+        
+        let elem_ref = self.stack.last()?;
+        let data = elem_ref.data.as_ref()?;
+        
+        let elem_size = 16usize;
+        let elem_offset = 16 + elem_ref.index * elem_size;
+        if elem_offset + 16 > data.len() {
+            return None;
+        }
+        
+        let pos = u32::from_le_bytes([data[elem_offset + 4], data[elem_offset + 5],
+                                       data[elem_offset + 6], data[elem_offset + 7]]) as usize;
+        let ksize = u32::from_le_bytes([data[elem_offset + 8], data[elem_offset + 9],
+                                        data[elem_offset + 10], data[elem_offset + 11]]) as usize;
+        
+        if pos + ksize > data.len() {
+            return None;
+        }
+        
+        Some(data[pos..pos + ksize].to_vec())
     }
 }
 

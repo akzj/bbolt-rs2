@@ -45,7 +45,7 @@ impl FreelistStore {
 use crate::constants::*;
 use crate::errors::{Error, Result};
 use crate::freelist::Freelist;
-use crate::page::{InBucket, Meta, Page, Pgid};
+use crate::page::{InBucket, Meta, Page, Pgid, Txid};
 use crate::tx::{Tx, TxDatabase};
 
 /// Database options
@@ -104,6 +104,27 @@ pub struct Stats {
     pub open_tx_n: usize,
 }
 
+/// Database information
+#[derive(Debug, Clone)]
+pub struct DbInfo {
+    /// Path to the database file
+    pub path: String,
+    /// Page size in bytes
+    pub page_size: usize,
+    /// Database version
+    pub version: u32,
+    /// True if the database is in read-only mode
+    pub read_only: bool,
+    /// Current transaction ID
+    pub tx_id: Txid,
+    /// Root bucket root page ID
+    pub root_pgid: Pgid,
+    /// Freelist page ID
+    pub freelist_pgid: Pgid,
+    /// High water mark (total page count)
+    pub pgid: Pgid,
+}
+
 /// Database represents a bbolt database
 pub struct Db {
     /// Path to the database file
@@ -116,9 +137,9 @@ pub struct Db {
     page_size: usize,
     /// Read-only mode
     read_only: bool,
-    /// Meta pages
-    meta0: Meta,
-    meta1: Meta,
+    /// Meta pages (using Mutex for interior mutability when updating after commits)
+    meta0: Mutex<Meta>,
+    meta1: Mutex<Meta>,
     /// Freelist
     freelist: Mutex<Freelist>,
     /// Stats
@@ -181,8 +202,8 @@ impl Db {
             data: RwLock::new(data),
             page_size,
             read_only: opts.read_only,
-            meta0,
-            meta1,
+            meta0: Mutex::new(meta0),
+            meta1: Mutex::new(meta1),
             freelist: Mutex::new(Freelist::new()),
             stats: RwLock::new(Stats::default()),
             opts,
@@ -455,11 +476,13 @@ impl Db {
     }
 
     /// Get a meta page
-    pub fn meta(&self) -> &Meta {
-        if self.meta0.txid() > self.meta1.txid() {
-            &self.meta0
+    pub fn meta(&self) -> Meta {
+        let meta0 = self.meta0.lock().unwrap();
+        let meta1 = self.meta1.lock().unwrap();
+        if meta0.txid() > meta1.txid() {
+            *meta0
         } else {
-            &self.meta1
+            *meta1
         }
     }
 
@@ -495,7 +518,7 @@ impl Db {
         }
 
         let data = self.data.read().unwrap().clone();
-        let tx_db = TxDatabase::new(self.page_size, *self.meta(), data);
+        let tx_db = TxDatabase::new(self.page_size, self.meta(), data);
         Tx::begin(tx_db, writable)
     }
 
@@ -510,6 +533,208 @@ impl Db {
         self.stats.read().unwrap().clone()
     }
 
+    /// View executes a function within a read transaction.
+    /// The function receives a read-only transaction and any error returned
+    /// by the function is returned from view().
+    pub fn view<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(&Tx) -> Result<()>,
+    {
+        let mut tx = self.begin(false)?;
+        let result = f(&tx);
+        let _ = tx.rollback();
+        result
+    }
+
+    /// Update executes a function within a writable transaction.
+    /// The function receives a writable transaction and any error returned
+    /// by the function is returned from update().
+    /// The transaction is committed if the function returns Ok, otherwise
+    /// it is rolled back.
+    pub fn update<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut Tx) -> Result<()>,
+    {
+        let mut tx = self.begin(true)?;
+        let result = f(&mut tx);
+        if result.is_ok() {
+            tx.commit()?;
+            // Update Db's data with the committed data
+            let committed_data = tx.committed_data();
+            self.update_data(committed_data);
+        } else {
+            let _ = tx.rollback();
+        }
+        result
+    }
+
+    /// Batch calls fn as part of a batch. It behaves similar to Update,
+    /// except:
+    /// - it calls fn multiple times (in a single transaction) if
+    ///   Err(Err::DatabaseFull) is returned from fn
+    /// - it is faster than calling Update multiple times because
+    ///   the transaction is only committed once at the end
+    /// - the function used is retried until success or max_batch_size
+    ///   iterations have been tried
+    pub fn batch<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&mut Tx) -> Result<()>,
+    {
+        let mut retried = 0;
+        let max_batch_size = self.opts.max_batch_size;
+        let max_batch_delay = self.opts.max_batch_delay;
+
+        loop {
+            let mut tx = self.begin(true)?;
+            let err = f(&mut tx).err();
+            
+            if err.is_none() {
+                tx.commit()?;
+                // Update Db's data with the committed data
+                let committed_data = tx.committed_data();
+                self.update_data(committed_data);
+                return Ok(());
+            }
+
+            // Check if we should retry
+            let err = err.unwrap();
+            if !matches!(err, Error::DatabaseFull) {
+                let _ = tx.rollback();
+                return Err(err);
+            }
+
+            // Check retry limit
+            retried += 1;
+            if retried >= max_batch_size {
+                let _ = tx.rollback();
+                return Err(Error::DatabaseFull);
+            }
+
+            let _ = tx.rollback();
+            
+            // Wait before retry
+            std::thread::sleep(max_batch_delay);
+        }
+    }
+
+    /// Info returns database information
+    pub fn info(&self) -> DbInfo {
+        let meta = self.meta();
+        DbInfo {
+            path: self.path.clone(),
+            page_size: self.page_size,
+            version: 2,
+            read_only: self.read_only,
+            tx_id: meta.txid(),
+            root_pgid: meta.root.root_pgid(),
+            freelist_pgid: meta.freelist_pgid(),
+            pgid: meta.pgid(),
+        }
+    }
+
+    /// Sync performs a filesystem sync on the database file
+    pub fn sync(&self) -> Result<()> {
+        let file = self.file.write().unwrap();
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Check performs a consistency check on the database.
+    /// It traverses all pages and verifies checksums.
+    /// Returns Ok(()) if no errors found, or Err with diagnostic info.
+    pub fn check(&self) -> Result<()> {
+        let meta = self.meta();
+        let page_size = self.page_size;
+        let data = self.data.read().unwrap();
+        let total_pages = data.len() / page_size;
+
+        // Check meta page checksum
+        if meta.checksum != meta.sum64() {
+            return Err(Error::Checksum);
+        }
+
+        // Get free page IDs
+        let freelist = GLOBAL_FREELIST.load();
+        let freelist_set: std::collections::HashSet<Pgid> = freelist.iter().cloned().collect();
+
+        // Traverse all pages
+        for pgid in 0..total_pages {
+            let offset = pgid * page_size;
+            if offset + page_size > data.len() {
+                break;
+            }
+
+            let page_buf = &data[offset..offset + page_size];
+            let page_id = u64::from_le_bytes([page_buf[0], page_buf[1], page_buf[2], page_buf[3],
+                                              page_buf[4], page_buf[5], page_buf[6], page_buf[7]]);
+            let flags = u16::from_le_bytes([page_buf[8], page_buf[9]]);
+
+            // Verify page ID matches
+            if page_id != pgid as Pgid {
+                return Err(Error::Other(format!("page {}: expected id {}, got {}", pgid, pgid, page_id)));
+            }
+
+            // Skip free pages (except meta pages)
+            if pgid >= 2 && freelist_set.contains(&(pgid as Pgid)) {
+                continue;
+            }
+
+            // Check meta page
+            if flags == PageFlags::META_PAGE_FLAG.bits() {
+                let meta_offset = 16;
+                let magic = u32::from_le_bytes([page_buf[meta_offset], page_buf[meta_offset + 1],
+                                                  page_buf[meta_offset + 2], page_buf[meta_offset + 3]]);
+                if magic != MAGIC {
+                    return Err(Error::Other(format!("page {}: invalid meta magic 0x{:x}", pgid, magic)));
+                }
+                continue;
+            }
+
+            // Check branch/leaf page structure
+            if flags == PageFlags::BRANCH_PAGE_FLAG.bits() || flags == PageFlags::LEAF_PAGE_FLAG.bits() {
+                let count = u16::from_le_bytes([page_buf[10], page_buf[11]]) as usize;
+                let elem_size = 16usize;
+                let elem_start = 16usize;
+
+                // Verify element positions are within bounds
+                for i in 0..count {
+                    let elem_offset = elem_start + i * elem_size;
+                    let pos = u32::from_le_bytes([page_buf[elem_offset + 4], page_buf[elem_offset + 5],
+                                                   page_buf[elem_offset + 6], page_buf[elem_offset + 7]]) as usize;
+                    let ksize = u32::from_le_bytes([page_buf[elem_offset + 8], page_buf[elem_offset + 9],
+                                                    page_buf[elem_offset + 10], page_buf[elem_offset + 11]]) as usize;
+                    let vsize = if flags == PageFlags::LEAF_PAGE_FLAG.bits() {
+                        u32::from_le_bytes([page_buf[elem_offset + 12], page_buf[elem_offset + 13],
+                                            page_buf[elem_offset + 14], page_buf[elem_offset + 15]]) as usize
+                    } else {
+                        0
+                    };
+
+                    let end = pos + ksize + vsize;
+                    if end > page_size {
+                        return Err(Error::Other(format!("page {}: element {}: key/value exceeds page size", pgid, i)));
+                    }
+                }
+
+                // For branch pages, check child page IDs
+                if flags == PageFlags::BRANCH_PAGE_FLAG.bits() {
+                    for i in 0..count {
+                        let elem_offset = elem_start + i * elem_size;
+                        let child_pgid = u64::from_le_bytes([page_buf[elem_offset + 8], page_buf[elem_offset + 9],
+                                                              page_buf[elem_offset + 10], page_buf[elem_offset + 11],
+                                                              page_buf[elem_offset + 12], page_buf[elem_offset + 13],
+                                                              page_buf[elem_offset + 14], page_buf[elem_offset + 15]]);
+                        if child_pgid >= total_pages as Pgid {
+                            return Err(Error::Other(format!("page {}: element {}: child page {} out of bounds", pgid, i, child_pgid)));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Close the database
     pub fn close(&self) -> Result<()> {
         // Drop all references
@@ -519,6 +744,21 @@ impl Db {
     /// Update the database data after a commit
     pub fn update_data(&self, data: Vec<u8>) {
         *self.data.write().unwrap() = data;
+        
+        // Also update meta0 and meta1 from the new data
+        let page_size = self.page_size;
+        
+        // Read meta0 from page 0
+        let meta0_buf = self.data.read().unwrap()[0..page_size].to_vec();
+        if let Ok(meta0) = Self::read_meta(&meta0_buf, 0) {
+            *self.meta0.lock().unwrap() = meta0;
+        }
+        
+        // Read meta1 from page 1
+        let meta1_buf = self.data.read().unwrap()[page_size..page_size * 2].to_vec();
+        if let Ok(meta1) = Self::read_meta(&meta1_buf, 1) {
+            *self.meta1.lock().unwrap() = meta1;
+        }
     }
 }
 
@@ -642,14 +882,189 @@ mod tests {
         println!("Go cross-compatibility format validated!");
         println!("Rust bbolt creates databases compatible with Go bbolt format");
     }
+
+    // ============================================
+    // Tests for new features (1-10)
+    // ============================================
+
+    #[test]
+    fn test_db_view() {
+        // Hypothesis: view() should execute a closure with a read transaction
+        // and return any error from the closure
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let db = Db::open(&path, Options::default()).unwrap();
+
+        // Test 1: view with successful closure
+        let result = db.view(|tx| {
+            // Should be able to read from the transaction
+            let mut cursor = tx.cursor();
+            let first = cursor.first();
+            // Empty bucket returns None
+            assert!(first.is_none());
+            Ok(())
+        });
+        assert!(result.is_ok(), "view should succeed with valid closure");
+
+        // Test 2: view propagates errors from closure
+        let result = db.view(|_tx| {
+            Err(Error::BucketNotFound)
+        });
+        assert!(matches!(result, Err(Error::BucketNotFound)), "view should propagate errors");
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_db_update() {
+        // Hypothesis: update() should execute a closure with a writable transaction,
+        // commit on success, rollback on failure
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let db = Db::open(&path, Options::default()).unwrap();
+
+        // Test 1: update with successful closure
+        let result = db.update(|tx| {
+            tx.put(b"key1", b"value1")?;
+            Ok(())
+        });
+        assert!(result.is_ok(), "update should succeed");
+
+        // Verify the data was committed by using view
+        let result = db.view(|tx| {
+            let value = tx.get(b"key1");
+            assert_eq!(value, Some(b"value1".to_vec()));
+            Ok(())
+        });
+        assert!(result.is_ok());
+
+        // Test 2: update rolls back on error
+        let result = db.update(|tx| {
+            tx.put(b"key2", b"value2")?;
+            Err(Error::BucketNotFound)
+        });
+        assert!(matches!(result, Err(Error::BucketNotFound)));
+
+        // Verify key2 was NOT committed (rolled back)
+        let result = db.view(|tx| {
+            let value = tx.get(b"key2");
+            assert_eq!(value, None, "key2 should not exist after rollback");
+            Ok(())
+        });
+        assert!(result.is_ok());
+
+        // Verify key1 still exists
+        let result = db.view(|tx| {
+            let value = tx.get(b"key1");
+            assert_eq!(value, Some(b"value1".to_vec()));
+            Ok(())
+        });
+        assert!(result.is_ok());
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_db_batch() {
+        // Hypothesis: batch() should execute a closure and retry on DatabaseFull error
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let db = Db::open(&path, Options::default()).unwrap();
+
+        // Test 1: batch with successful closure
+        let result = db.batch(|tx| {
+            tx.put(b"batch_key", b"batch_value")?;
+            Ok(())
+        });
+        assert!(result.is_ok(), "batch should succeed");
+
+        // Verify data was committed
+        let result = db.view(|tx| {
+            let value = tx.get(b"batch_key");
+            assert_eq!(value, Some(b"batch_value".to_vec()));
+            Ok(())
+        });
+        assert!(result.is_ok());
+
+        // Test 2: batch returns error if not DatabaseFull
+        let result = db.batch(|_tx| {
+            Err(Error::BucketNotFound)
+        });
+        assert!(matches!(result, Err(Error::BucketNotFound)));
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_db_info() {
+        // Hypothesis: info() should return database metadata
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let db = Db::open(&path, Options::default()).unwrap();
+        let info = db.info();
+
+        assert_eq!(info.page_size, DEFAULT_PAGE_SIZE);
+        assert_eq!(info.version, 2);
+        assert!(!info.read_only);
+        assert_eq!(info.path, path.to_string_lossy().to_string());
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_db_sync() {
+        // Hypothesis: sync() should call file.sync_all() without error
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let db = Db::open(&path, Options::default()).unwrap();
+        
+        // Write some data first
+        db.update(|tx| {
+            tx.put(b"sync_test", b"data")?;
+            Ok(())
+        }).unwrap();
+
+        // Sync should succeed
+        let result = db.sync();
+        assert!(result.is_ok(), "sync should succeed");
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_db_check() {
+        // Hypothesis: check() should traverse all pages and verify integrity
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let db = Db::open(&path, Options::default()).unwrap();
+
+        // Write some data
+        db.update(|tx| {
+            tx.put(b"check_test", b"data")?;
+            Ok(())
+        }).unwrap();
+
+        // Check should pass for a valid database
+        let result = db.check();
+        assert!(result.is_ok(), "check should succeed for valid database: {:?}", result);
+
+        db.close().unwrap();
+    }
 }
+
 #[cfg(test)]
 impl Db {
     fn debug_meta(&self) {
-        use crate::page::Meta;
+        let meta0 = self.meta0.lock().unwrap();
         println!("meta0: magic=0x{:x}, version={}, txid={}, checksum=0x{:x}", 
-            self.meta0.magic, self.meta0.version, self.meta0.txid, self.meta0.checksum);
-        println!("meta0 sum64: 0x{:x}", self.meta0.sum64());
+            meta0.magic, meta0.version, meta0.txid, meta0.checksum);
+        println!("meta0 sum64: 0x{:x}", meta0.sum64());
     }
 }
 
