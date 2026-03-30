@@ -770,6 +770,20 @@ impl Bucket {
         Ok(())
     }
 
+    /// Sequence returns the current integer sequence for the bucket without incrementing it.
+    pub fn sequence(&self) -> u64 {
+        self.inbucket.sequence()
+    }
+
+    /// SetSequence updates the sequence number for the bucket.
+    pub fn set_sequence(&mut self, sequence: u64) -> Result<()> {
+        if !self.writable {
+            return Err(Error::TxNotWritable);
+        }
+        self.inbucket.set_sequence(sequence);
+        Ok(())
+    }
+
     /// NextSequence returns the next integer sequence for the bucket.
     /// The sequence is stored in the InBucket header and is incremented on each call.
     pub fn next_sequence(&mut self) -> Result<u64> {
@@ -1307,6 +1321,32 @@ mod tests {
     // ============================================
     // Tests for new features (4-6)
     // ============================================
+
+    #[test]
+    fn test_sequence_and_set_sequence() {
+        let mut bucket = create_writable_bucket();
+        
+        // Initial sequence is 0
+        assert_eq!(bucket.sequence(), 0, "Initial sequence should be 0");
+        
+        // Set sequence to 100
+        bucket.set_sequence(100).unwrap();
+        assert_eq!(bucket.sequence(), 100, "Sequence should be 100 after set_sequence");
+        
+        // Set sequence to 0
+        bucket.set_sequence(0).unwrap();
+        assert_eq!(bucket.sequence(), 0, "Sequence should be 0 after set_sequence");
+    }
+
+    #[test]
+    fn test_set_sequence_not_writable() {
+        let mut bucket = create_bucket_with_data();
+        
+        // Setting sequence on non-writable bucket should fail
+        let result = bucket.set_sequence(100);
+        assert!(result.is_err(), "set_sequence should fail on non-writable bucket");
+        assert!(matches!(result.unwrap_err(), Error::TxNotWritable));
+    }
 
     #[test]
     fn test_next_sequence() {

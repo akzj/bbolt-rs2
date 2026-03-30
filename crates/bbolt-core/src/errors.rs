@@ -32,6 +32,10 @@ pub enum Error {
     #[error("checksum mismatch")]
     Checksum,
 
+    /// Operation timed out
+    #[error("operation timed out")]
+    Timeout,
+
     /// Transaction is closed
     #[error("transaction is not open")]
     TxClosed,
