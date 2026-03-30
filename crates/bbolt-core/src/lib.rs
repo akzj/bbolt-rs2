@@ -48,3 +48,6 @@ pub use page::{
     BranchPageElement, InBucket, Inode, LeafPageElement, Meta, Page, PageInfo, Pgid, Txid,
 };
 pub use tx::{Tx, TxStats, WriteTo};
+
+#[cfg(test)]
+mod concurrent_test;
