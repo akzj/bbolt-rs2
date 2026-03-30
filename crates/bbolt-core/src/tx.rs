@@ -86,6 +86,16 @@ impl Tx {
         self.meta.txid()
     }
 
+    /// Returns a debug string describing the transaction
+    pub fn inspect(&self) -> String {
+        format!(
+            "Tx {{ id: {}, writable: {}, page_count: {} }}",
+            self.id(),
+            self.writable,
+            self.stats.page_count
+        )
+    }
+
     /// Check if writable
     pub fn writable(&self) -> bool {
         self.writable
@@ -888,5 +898,44 @@ mod tests {
         // Verify meta page headers
         assert_eq!(buf[0..8], 0u64.to_le_bytes()); // meta 0 page id
         assert_eq!(buf[page_size..page_size + 8], 1u64.to_le_bytes()); // meta 1 page id
+    }
+
+    #[test]
+    fn test_tx_inspect() {
+        let page_size = 4096;
+        let meta = Meta::new(
+            page_size as u32,
+            2,
+            InBucket::new(3, 0),
+            4,
+            1,
+        );
+
+        let data = vec![0u8; page_size * 5];
+        let db = TxDatabase::new(page_size, meta, data);
+        let tx = Tx::begin(db, false).unwrap();
+
+        let inspect = tx.inspect();
+        assert!(inspect.contains("id: 1"));
+        assert!(inspect.contains("writable: false"));
+    }
+
+    #[test]
+    fn test_tx_inspect_writable() {
+        let page_size = 4096;
+        let meta = Meta::new(
+            page_size as u32,
+            2,
+            InBucket::new(3, 0),
+            4,
+            1,
+        );
+
+        let data = vec![0u8; page_size * 5];
+        let db = TxDatabase::new(page_size, meta, data);
+        let tx = Tx::begin(db, true).unwrap();
+
+        let inspect = tx.inspect();
+        assert!(inspect.contains("writable: true"));
     }
 }

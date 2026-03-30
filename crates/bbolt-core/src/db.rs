@@ -475,6 +475,11 @@ impl Db {
         self.page_size
     }
 
+    /// Returns true if the database was opened in read-only mode
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     /// Get a meta page
     pub fn meta(&self) -> Meta {
         let meta0 = self.meta0.lock().unwrap();
@@ -812,6 +817,24 @@ mod tests {
         // Check page IDs
         assert!(meta.txid() == 0 || meta.txid() == 1);
 
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_db_is_read_only() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        // Default options - not read only
+        let db = Db::open(&path, Options::default()).unwrap();
+        assert!(!db.is_read_only());
+        db.close().unwrap();
+
+        // Explicit read_only option
+        let mut opts = Options::default();
+        opts.read_only = true;
+        let db = Db::open(&path, opts).unwrap();
+        assert!(db.is_read_only());
         db.close().unwrap();
     }
     
