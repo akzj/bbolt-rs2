@@ -3,12 +3,32 @@
 //! Transactions provide read-only or read-write access to the database.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::io::Write;
+use std::path::Path;
 
 use crate::bucket::Bucket;
 use crate::constants::*;
+use crate::db::GLOBAL_FREELIST;
 use crate::errors::{Error, Result};
-use crate::page::{Meta, Page, Pgid, Txid};
+use crate::page::{Meta, Page, PageInfo, Pgid, Txid};
+
+/// WriteTo trait - similar to Go's io.WriterTo interface.
+/// Types implementing this trait can write themselves to a writer.
+pub trait WriteTo {
+    /// Write self to the provided writer.
+    /// Returns the number of bytes written.
+    fn write_to(&mut self, w: &mut dyn Write) -> Result<usize>;
+}
+
+impl WriteTo for Tx {
+    /// Write the entire database to a writer.
+    /// 
+    /// This writes the entire database content (both meta pages and data pages)
+    /// to the provided writer.
+    fn write_to(&mut self, w: &mut dyn Write) -> Result<usize> {
+        Tx::write_to(self, w)
+    }
+}
 
 /// Transaction statistics
 #[derive(Debug, Clone, Default)]
@@ -121,9 +141,194 @@ impl Tx {
         self.db.page_data(pgid)
     }
 
-    /// Get page info
+    /// Get page info (low-level page access)
     pub fn page(&self, pgid: Pgid) -> Page {
         self.db.page(pgid)
+    }
+
+    /// Get page information by page ID.
+    ///
+    /// Returns `Ok(Some(PageInfo))` if the page exists, `Ok(None)` if the page ID
+    /// is at or beyond the high water mark, or an error if the transaction is
+    /// closed or the freelist is not loaded.
+    ///
+    /// The page type will be "free" if the page has been freed.
+    pub fn page_info(&self, id: u64) -> Result<Option<PageInfo>> {
+        // Check if transaction is closed
+        if self.db.meta().is_err() {
+            return Err(Error::TxClosed);
+        }
+
+        // Return None if page ID is at or beyond high water mark
+        if id >= self.meta.pgid() {
+            return Ok(None);
+        }
+
+        // Build page info
+        let pgid = id as Pgid;
+        let p = self.db.page(pgid);
+
+        // Check if page is freed (requires freelist to be loaded)
+        let typ = if self.meta.freelist_pgid() != PGID_NO_FREELIST {
+            let free_pages = GLOBAL_FREELIST.load();
+            if free_pages.is_empty() {
+                // Freelist pgid is set but no pages have been freed yet
+                p.typ().to_string()
+            } else if free_pages.contains(&pgid) {
+                "free".to_string()
+            } else {
+                p.typ().to_string()
+            }
+        } else {
+            p.typ().to_string()
+        };
+
+        let info = PageInfo {
+            id: id as u64,
+            typ,
+            count: p.count,
+            overflow: p.overflow,
+        };
+
+        Ok(Some(info))
+    }
+
+    /// Copy the database to a writer.
+    ///
+    /// This writes the entire database content (both meta pages and data pages)
+    /// to the provided writer.
+    pub fn copy(&mut self, w: &mut dyn Write) -> Result<()> {
+        self.write_to(w)?;
+        Ok(())
+    }
+
+    /// Write the entire database to a writer.
+    ///
+    /// Returns the number of bytes written.
+    ///
+    /// This is the main implementation used by both `copy` and `copy_file`.
+    pub fn write_to(&self, w: &mut dyn Write) -> Result<usize> {
+        let page_size = self.db.page_size();
+        let mut n = 0;
+
+        // Generate a meta page buffer
+        let mut buf = vec![0u8; page_size];
+
+        // Write meta 0 with current txid
+        buf[0..8].copy_from_slice(&0u64.to_le_bytes()); // page id = 0
+        buf[8..10].copy_from_slice(&PageFlags::META_PAGE_FLAG.bits().to_le_bytes());
+        buf[10..12].copy_from_slice(&0u16.to_le_bytes()); // count = 0
+        buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // overflow = 0
+
+        let meta_offset = 16;
+        buf[meta_offset..meta_offset + 4].copy_from_slice(&self.meta.magic.to_le_bytes());
+        buf[meta_offset + 4..meta_offset + 8].copy_from_slice(&self.meta.version.to_le_bytes());
+        buf[meta_offset + 8..meta_offset + 12].copy_from_slice(&self.meta.page_size.to_le_bytes());
+        buf[meta_offset + 12..meta_offset + 16].copy_from_slice(&self.meta.flags.to_le_bytes());
+        buf[meta_offset + 16..meta_offset + 24].copy_from_slice(&self.meta.root.root.to_le_bytes());
+        buf[meta_offset + 24..meta_offset + 32].copy_from_slice(&self.meta.root.sequence.to_le_bytes());
+        buf[meta_offset + 32..meta_offset + 40].copy_from_slice(&self.meta.freelist.to_le_bytes());
+        buf[meta_offset + 40..meta_offset + 48].copy_from_slice(&self.meta.pgid.to_le_bytes());
+        buf[meta_offset + 48..meta_offset + 56].copy_from_slice(&self.meta.txid.to_le_bytes());
+        // Calculate checksum for meta 0
+        let checksum = self.calculate_meta_checksum(&buf, meta_offset);
+        buf[meta_offset + 56..meta_offset + 64].copy_from_slice(&checksum.to_le_bytes());
+
+        w.write_all(&buf)?;
+        n += page_size;
+
+        // Write meta 1 with lower transaction id (txid - 1)
+        buf[0..8].copy_from_slice(&1u64.to_le_bytes()); // page id = 1
+        buf[meta_offset + 48..meta_offset + 56].copy_from_slice(&self.meta.txid.wrapping_sub(1).to_le_bytes());
+        // Calculate checksum for meta 1
+        let checksum = self.calculate_meta_checksum(&buf, meta_offset);
+        buf[meta_offset + 56..meta_offset + 64].copy_from_slice(&checksum.to_le_bytes());
+
+        w.write_all(&buf)?;
+        n += page_size;
+
+        // Copy data pages (from page 2 onwards)
+        let data = self.db.get_data();
+        let data_offset = 2 * page_size;
+        let data_size = data.len() - data_offset;
+
+        if data_size > 0 {
+            w.write_all(&data[data_offset..])?;
+            n += data_size;
+        }
+
+        Ok(n)
+    }
+
+    /// Calculate checksum for a meta page buffer
+    fn calculate_meta_checksum(&self, buf: &[u8], meta_offset: usize) -> u64 {
+        // Create a Meta struct from the buffer for checksum calculation
+        // buf[meta_offset..] contains the 64-byte Meta structure
+        let ptr = buf[meta_offset..meta_offset + 64].as_ptr();
+        let meta = unsafe { &*(ptr as *const Meta) };
+        meta.sum64()
+    }
+
+    /// Copy the database to a file at the given path.
+    ///
+    /// The file will be created with the specified mode if it doesn't exist,
+    /// or truncated if it does exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The path to the output file
+    /// * `mode` - The file permissions (e.g., 0o644 on Unix, ignored on other platforms)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let tx = db.begin_read()?;
+    /// tx.copy_file("backup.db", 0o644)?;
+    /// ```
+    #[cfg(unix)]
+    pub fn copy_file<P: AsRef<Path>>(&self, path: P, mode: u32) -> Result<()> {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let path = path.as_ref();
+
+        // Open file with specified mode
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(path)?;
+
+        let mut file = file;
+        self.write_to(&mut file)?;
+
+        // Close the file
+        file.flush()?;
+        file.sync_all()?;
+
+        Ok(())
+    }
+
+    /// Copy the database to a file at the given path (non-Unix implementation).
+    ///
+    /// On non-Unix platforms, the mode parameter is ignored and a default mode is used.
+    #[cfg(not(unix))]
+    pub fn copy_file<P: AsRef<Path>>(&self, path: P, _mode: u32) -> Result<()> {
+        use std::fs::File;
+
+        let path = path.as_ref();
+
+        // Create file with default permissions
+        let mut file = File::create(path)?;
+
+        self.write_to(&mut file)?;
+
+        // Close the file
+        file.flush()?;
+        file.sync_all()?;
+
+        Ok(())
     }
 
     /// Allocate a new page
@@ -432,5 +637,256 @@ impl TxDatabase {
 
 #[cfg(test)]
 mod tests {
-    // TODO: Add transaction tests
+    use super::*;
+    use crate::page::InBucket;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_write_to() {
+        // Create a minimal database for testing
+        let page_size = 4096;
+        let meta = Meta::new(
+            page_size as u32,
+            2, // freelist_pgid
+            InBucket::new(3, 0), // root bucket at page 3
+            4, // pgid = 4 (2 meta pages + 1 freelist + 1 root)
+            1, // txid = 1
+        );
+
+        // Create minimal data (2 meta pages + some data)
+        let mut data = vec![0u8; page_size * 5];
+        // Page 0 and 1 are meta pages, will be overwritten
+        // Pages 2-4 are data
+
+        let db = TxDatabase::new(page_size, meta, data);
+        let tx = Tx::begin(db, false).unwrap();
+
+        // Test write_to
+        let mut buf = Vec::new();
+        let n = tx.write_to(&mut buf).unwrap();
+
+        // Should have written: 2 meta pages + 3 data pages
+        assert_eq!(n, page_size * 5);
+
+        // Verify meta 0 is at the start
+        assert_eq!(buf[0..8], 0u64.to_le_bytes()); // page id = 0
+
+        // Verify meta 1 is at page_size
+        assert_eq!(buf[page_size..page_size + 8], 1u64.to_le_bytes()); // page id = 1
+    }
+
+    #[test]
+    fn test_copy() {
+        let page_size = 4096;
+        let meta = Meta::new(
+            page_size as u32,
+            2,
+            InBucket::new(3, 0),
+            4,
+            1,
+        );
+
+        let data = vec![0u8; page_size * 5];
+        let db = TxDatabase::new(page_size, meta, data);
+        let mut tx = Tx::begin(db, false).unwrap();
+
+        // Test copy
+        let mut buf = Vec::new();
+        tx.copy(&mut buf).unwrap();
+
+        assert_eq!(buf.len(), page_size * 5);
+    }
+
+    #[test]
+    fn test_copy_file() {
+        let page_size = 4096;
+        let meta = Meta::new(
+            page_size as u32,
+            2,
+            InBucket::new(3, 0),
+            4,
+            1,
+        );
+
+        let data = vec![0u8; page_size * 5];
+        let db = TxDatabase::new(page_size, meta, data);
+        let tx = Tx::begin(db, false).unwrap();
+
+        // Create temp file
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("test_copy.db");
+
+        // Copy to file
+        #[cfg(unix)]
+        tx.copy_file(&path, 0o644).unwrap();
+        #[cfg(not(unix))]
+        tx.copy_file(&path, 0).unwrap();
+
+        // Verify file exists and has correct size
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.len() as usize, page_size * 5);
+    }
+
+    #[test]
+    fn test_page_info() {
+        // Clear any global freelist state from other tests
+        GLOBAL_FREELIST.store(vec![]);
+
+        let page_size = 4096;
+        let meta = Meta::new(
+            page_size as u32,
+            2,
+            InBucket::new(3, 0),
+            4, // pgid = 4
+            1,
+        );
+
+        let mut data = vec![0u8; page_size * 5];
+        // Set page 0 and 1 to be meta pages
+        data[0 * page_size + 8..0 * page_size + 10].copy_from_slice(&PageFlags::META_PAGE_FLAG.bits().to_le_bytes());
+        data[1 * page_size + 8..1 * page_size + 10].copy_from_slice(&PageFlags::META_PAGE_FLAG.bits().to_le_bytes());
+        // Set page 3 to be a leaf page
+        data[3 * page_size + 8..3 * page_size + 10].copy_from_slice(&PageFlags::LEAF_PAGE_FLAG.bits().to_le_bytes());
+        data[3 * page_size + 10..3 * page_size + 12].copy_from_slice(&2u16.to_le_bytes()); // count = 2
+
+        let db = TxDatabase::new(page_size, meta, data);
+        let tx = Tx::begin(db, false).unwrap();
+
+        // Page 0 (meta) should return info
+        let info = tx.page_info(0).unwrap();
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.id, 0);
+        assert_eq!(info.typ, "meta");
+
+        // Page 3 (leaf) should return info
+        let info = tx.page_info(3).unwrap();
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.id, 3);
+        assert_eq!(info.typ, "leaf");
+
+        // Page beyond pgid should return None
+        let info = tx.page_info(5).unwrap();
+        assert!(info.is_none());
+
+        // Page at pgid should return None
+        let info = tx.page_info(4).unwrap();
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn test_page_info_free_page() {
+        let page_size = 4096;
+        let meta = Meta::new(
+            page_size as u32,
+            2,
+            InBucket::new(3, 0),
+            5, // pgid = 5
+            1,
+        );
+
+        let data = vec![0u8; page_size * 6];
+
+        let db = TxDatabase::new(page_size, meta, data);
+        let tx = Tx::begin(db, false).unwrap();
+
+        // Add page 3 to free list
+        GLOBAL_FREELIST.store(vec![3]);
+
+        // Page 3 should be marked as free
+        let info = tx.page_info(3).unwrap();
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.typ, "free");
+
+        // Clean up global state
+        GLOBAL_FREELIST.store(vec![]);
+    }
+
+    #[test]
+    fn test_meta_checksum_in_write_to() {
+        let page_size = 4096;
+        let meta = Meta::new(
+            page_size as u32,
+            2,
+            InBucket::new(3, 0),
+            4,
+            5, // txid = 5
+        );
+
+        let data = vec![0u8; page_size * 5];
+        let db = TxDatabase::new(page_size, meta, data);
+        let tx = Tx::begin(db, false).unwrap();
+
+        let mut buf = Vec::new();
+        tx.write_to(&mut buf).unwrap();
+
+        // Verify meta 0 has correct checksum
+        let meta0_offset = 16; // Meta data starts at offset 16
+        let ptr = unsafe { buf[meta0_offset..meta0_offset + 64].as_ptr() };
+        let written_meta = unsafe { &*(ptr as *const Meta) };
+        let expected_checksum = written_meta.sum64();
+
+        // The checksum written should match
+        let checksum_offset = meta0_offset + 56;
+        let written_checksum = u64::from_le_bytes([
+            buf[checksum_offset],
+            buf[checksum_offset + 1],
+            buf[checksum_offset + 2],
+            buf[checksum_offset + 3],
+            buf[checksum_offset + 4],
+            buf[checksum_offset + 5],
+            buf[checksum_offset + 6],
+            buf[checksum_offset + 7],
+        ]);
+        assert_eq!(written_checksum, expected_checksum);
+
+        // Meta 1 should have txid - 1
+        let meta1_txid_offset = page_size + meta0_offset + 48;
+        let meta1_txid = u64::from_le_bytes([
+            buf[meta1_txid_offset],
+            buf[meta1_txid_offset + 1],
+            buf[meta1_txid_offset + 2],
+            buf[meta1_txid_offset + 3],
+            buf[meta1_txid_offset + 4],
+            buf[meta1_txid_offset + 5],
+            buf[meta1_txid_offset + 6],
+            buf[meta1_txid_offset + 7],
+        ]);
+        assert_eq!(meta1_txid, 4); // 5 - 1
+    }
+
+    #[test]
+    fn test_tx_write_to_trait() {
+        // Test that the WriteTo trait is properly implemented
+        use crate::tx::WriteTo;
+        
+        let page_size = 4096;
+        let meta = Meta::new(
+            page_size as u32,
+            2,
+            InBucket::new(3, 0),
+            4,
+            1,
+        );
+
+        let data = vec![0u8; page_size * 5];
+        let db = TxDatabase::new(page_size, meta, data);
+        let mut tx = Tx::begin(db, false).unwrap();
+
+        // Test WriteTo trait implementation
+        let mut buf = Vec::new();
+        let n = WriteTo::write_to(&mut tx, &mut buf).unwrap();
+
+        // Should have written 5 pages (2 meta + 3 data)
+        assert_eq!(n, page_size * 5);
+        
+        // Verify the data was written correctly
+        assert_eq!(buf.len(), page_size * 5);
+        
+        // Verify meta page headers
+        assert_eq!(buf[0..8], 0u64.to_le_bytes()); // meta 0 page id
+        assert_eq!(buf[page_size..page_size + 8], 1u64.to_le_bytes()); // meta 1 page id
+    }
 }

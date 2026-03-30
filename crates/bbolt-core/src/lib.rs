@@ -46,4 +46,4 @@ pub use node::Node;
 pub use page::{
     BranchPageElement, InBucket, Inode, LeafPageElement, Meta, Page, PageInfo, Pgid, Txid,
 };
-pub use tx::{Tx, TxStats};
+pub use tx::{Tx, TxStats, WriteTo};
