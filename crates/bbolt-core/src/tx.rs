@@ -134,6 +134,8 @@ pub struct Tx {
     root: Bucket,
     /// Stats
     pub stats: TxStats,
+    /// Commit handlers (callbacks executed after successful commit)
+    commit_handlers: Vec<Box<dyn FnOnce() + 'static>>,
 }
 
 impl Tx {
@@ -150,9 +152,18 @@ impl Tx {
             meta,
             root,
             stats: TxStats::default(),
+            commit_handlers: Vec::new(),
         };
 
         Ok(tx)
+    }
+    
+    /// Add a handler to be executed after the transaction successfully commits.
+    pub fn on_commit<F>(&mut self, callback: F)
+    where
+        F: FnOnce() + 'static,
+    {
+        self.commit_handlers.push(Box::new(callback));
     }
     
     /// Get the database handle
@@ -517,6 +528,13 @@ impl Tx {
         }
         // Write dirty pages
         self.write_pages()?;
+        
+        // Execute commit handlers
+        let handlers: Vec<Box<dyn FnOnce() + 'static>> = self.commit_handlers.drain(..).collect();
+        for handler in handlers {
+            handler();
+        }
+        
         Ok(())
     }
 
@@ -1218,5 +1236,37 @@ mod tests {
 
         // Tx::size() should return the data size
         assert_eq!(tx.size(), (page_size * 5) as u64);
+    }
+    
+    #[test]
+    fn test_tx_on_commit() {
+        use std::sync::{Arc, Mutex};
+        
+        let page_size = 4096;
+        let meta = Meta::new(
+            page_size as u32,
+            2,
+            InBucket::new(0, 0), // empty bucket
+            4,
+            1,
+        );
+
+        let data = vec![0u8; page_size * 5];
+        let tx_db = TxDatabase::new(page_size, meta, data, None);
+        let mut tx = Tx::begin(tx_db, true).unwrap();
+
+        // Track if callback was called using Arc<Mutex>
+        let called = Arc::new(Mutex::new(false));
+        let called_clone = called.clone();
+        
+        // Add commit handler
+        tx.on_commit(move || {
+            *called_clone.lock().unwrap() = true;
+        });
+        
+        // Commit should execute the handler
+        tx.commit().unwrap();
+        
+        assert!(*called.lock().unwrap(), "on_commit callback should have been called");
     }
 }
