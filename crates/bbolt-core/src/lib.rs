@@ -33,6 +33,7 @@ pub mod errors;
 pub mod freelist;
 pub mod node;
 pub mod page;
+pub mod platform;
 pub mod tx;
 
 // Re-exports

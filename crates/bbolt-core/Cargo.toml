@@ -18,6 +18,10 @@ thiserror = "2"
 # Bitflags for page flags
 bitflags = "2"
 
+# Platform-specific: mlock support
+[target.'cfg(any(unix, target_os = "macos"))'.dependencies]
+libc = "0.2"
+
 # For testing
 tempfile = { version = "3", optional = true }
 
