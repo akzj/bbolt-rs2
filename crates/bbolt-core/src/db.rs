@@ -479,6 +479,11 @@ impl Db {
     pub fn is_read_only(&self) -> bool {
         self.read_only
     }
+    
+    /// Get the current database file size in bytes
+    pub fn file_size(&self) -> u64 {
+        self.data.read().unwrap().len() as u64
+    }
 
     /// Get a meta page
     pub fn meta(&self) -> Meta {
@@ -1252,6 +1257,25 @@ mod go_read_tests {
         // Size should still be new_size
         let metadata = std::fs::metadata(&db_path).unwrap();
         assert_eq!(metadata.len() as usize, new_size);
+        
+        db.close().unwrap();
+        std::fs::remove_file(&db_path).ok();
+    }
+    
+    #[test]
+    fn test_db_file_size() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join("test_file_size.db");
+        
+        let db = Db::open(&db_path, Options::default()).unwrap();
+        
+        // DB::file_size should return current file size
+        let size = db.file_size();
+        assert!(size > 0, "File size should be greater than 0");
+        
+        // Initial size should be at least 3 pages (meta0, meta1, freelist)
+        // May include root page depending on implementation
+        assert!(size >= db.page_size() as u64 * 3, "File size should be at least 3 pages");
         
         db.close().unwrap();
         std::fs::remove_file(&db_path).ok();

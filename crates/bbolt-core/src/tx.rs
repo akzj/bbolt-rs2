@@ -80,6 +80,16 @@ impl Tx {
 
         Ok(tx)
     }
+    
+    /// Get the database handle
+    pub fn db(&self) -> TxDatabase {
+        self.db.clone()
+    }
+    
+    /// Get database size in bytes
+    pub fn size(&self) -> u64 {
+        self.db.data.lock().unwrap().len() as u64
+    }
 
     /// Get the transaction ID
     pub fn id(&self) -> Txid {
@@ -1033,5 +1043,44 @@ mod tests {
 
         // For empty bucket, should visit at least root (page 0)
         assert!(count >= 1, "Should visit at least root page");
+    }
+    
+    #[test]
+    fn test_tx_db() {
+        let page_size = 4096;
+        let meta = Meta::new(
+            page_size as u32,
+            2,
+            InBucket::new(3, 0),
+            4,
+            1,
+        );
+
+        let data = vec![0u8; page_size * 5];
+        let tx_db = TxDatabase::new(page_size, meta, data);
+        let tx = Tx::begin(tx_db, false).unwrap();
+
+        // Tx::db() should return the TxDatabase
+        let db = tx.db();
+        assert_eq!(db.page_size(), page_size);
+    }
+    
+    #[test]
+    fn test_tx_size() {
+        let page_size = 4096;
+        let meta = Meta::new(
+            page_size as u32,
+            2,
+            InBucket::new(3, 0),
+            4,
+            1,
+        );
+
+        let data = vec![0u8; page_size * 5];
+        let tx_db = TxDatabase::new(page_size, meta, data);
+        let tx = Tx::begin(tx_db, false).unwrap();
+
+        // Tx::size() should return the data size
+        assert_eq!(tx.size(), (page_size * 5) as u64);
     }
 }
