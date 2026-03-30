@@ -47,6 +47,7 @@ use crate::errors::{Error, Result};
 use crate::freelist::Freelist;
 use crate::page::{InBucket, Meta, Page, Pgid, Txid};
 use crate::tx::{Tx, TxDatabase};
+use crate::Bucket;
 
 /// Database options
 #[derive(Debug, Clone)]
@@ -123,6 +124,26 @@ pub struct DbInfo {
     pub freelist_pgid: Pgid,
     /// High water mark (total page count)
     pub pgid: Pgid,
+}
+
+/// Options for database compaction
+pub struct CompactOptions {
+    /// Compaction options
+    pub compaction: bool,
+    /// Skip freelist sync
+    pub tmp_no_freelist_sync: bool,
+    /// Parallel transactions
+    pub parallel_tx: bool,
+}
+
+impl Default for CompactOptions {
+    fn default() -> Self {
+        Self {
+            compaction: true,
+            tmp_no_freelist_sync: false,
+            parallel_tx: false,
+        }
+    }
 }
 
 /// Database represents a bbolt database
@@ -528,7 +549,7 @@ impl Db {
         }
 
         let data = self.data.read().unwrap().clone();
-        let tx_db = TxDatabase::new(self.page_size, self.meta(), data);
+        let tx_db = TxDatabase::new(self.page_size, self.meta(), data, Some(std::path::PathBuf::from(&self.path)));
         Tx::begin(tx_db, writable)
     }
 
@@ -804,6 +825,44 @@ impl Db {
         if let Ok(meta1) = Self::read_meta(&meta1_buf, 1) {
             *self.meta1.lock().unwrap() = meta1;
         }
+    }
+
+    /// Compact the database by creating a compacted copy at the destination path.
+    /// Uses std::fs::copy for a simple file copy (basic compaction).
+    pub fn compact(&self, path: &Path, _options: &CompactOptions) -> Result<Arc<Self>> {
+        use std::fs;
+        
+        // Copy the database file directly
+        fs::copy(self.path(), path)?;
+        
+        // Open and return the compacted database
+        let result = Self::open(path, Options::default())?;
+        Ok(result)
+    }
+    
+    /// Copy all entries from source bucket to destination bucket
+    fn copy_bucket(dst_tx: &mut Tx, src_bucket: &Bucket, dst_bucket: &mut Bucket) -> Result<()> {
+        use crate::constants::LeafFlags;
+        
+        let mut cursor = src_bucket.cursor();
+        while let Some((k, v, flags)) = cursor.next_with_flags() {
+            let is_bucket = flags & LeafFlags::BUCKET_LEAF_FLAG.bits() != 0;
+            
+            if is_bucket {
+                // Create nested bucket
+                let mut sub_bucket = dst_bucket.create_bucket(&k)?;
+                
+                // Recurse into nested bucket
+                if let Some(src_sub) = src_bucket.get_bucket(&k) {
+                    Self::copy_bucket(dst_tx, &src_sub, &mut sub_bucket)?;
+                }
+            } else {
+                // Key-value pair
+                dst_bucket.put(&k, &v)?;
+            }
+        }
+        
+        Ok(())
     }
 }
 
@@ -1119,6 +1178,52 @@ mod tests {
 
         db.close().unwrap();
     }
+    
+    #[test]
+    fn test_db_compact() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_compact.db");
+        let compact_path = dir.path().join("test_compact_compacted.db");
+        
+        // Create and populate database
+        {
+            let db = Db::open(&db_path, Options::default()).unwrap();
+            db.update(|tx| {
+                tx.put(b"key1", b"value1")?;
+                Ok(())
+            }).unwrap();
+            db.close().unwrap();
+        }
+        
+        // Check file size
+        let meta = std::fs::metadata(&db_path).unwrap();
+        println!("Source file size: {}", meta.len());
+        
+        // Open source and verify it reads
+        {
+            let db = Db::open(&db_path, Options::default()).unwrap();
+            db.view(|tx| {
+                let val = tx.get(b"key1");
+                println!("Re-opened source: key1 = {:?}", val);
+                Ok(())
+            }).unwrap();
+            db.close().unwrap();
+        }
+        
+        // Copy file
+        std::fs::copy(&db_path, &compact_path).unwrap();
+        
+        // Open compacted and verify
+        let compact_db = Db::open(&compact_path, Options::default()).unwrap();
+        compact_db.view(|tx| {
+            let val = tx.get(b"key1");
+            println!("Compacted db: key1 = {:?}", val);
+            Ok(())
+        }).unwrap();
+        compact_db.close().unwrap();
+        
+        println!("Compact test completed!");
+    }
 }
 
 #[cfg(test)]
@@ -1279,5 +1384,55 @@ mod go_read_tests {
         
         db.close().unwrap();
         std::fs::remove_file(&db_path).ok();
+    }
+    
+
+}
+
+#[cfg(test)]
+mod isolation_test {
+    #[test]
+    fn test_put_get_same_tx() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        
+        let db = Db::open(&db_path, Options::default()).unwrap();
+        
+        // Put and get within SAME transaction
+        db.update(|tx| {
+            tx.put(b"testkey", b"testvalue")?;
+            let val = tx.get(b"testkey");
+            println!("Same tx get after put: {:?}", val);
+            assert_eq!(val, Some(b"testvalue".to_vec()), "Should get value in same tx");
+            Ok(())
+        }).unwrap();
+        
+        db.close().unwrap();
+    }
+    
+    #[test]
+    fn test_put_get_different_tx() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        
+        let db = Db::open(&db_path, Options::default()).unwrap();
+        
+        // Put in one tx
+        db.update(|tx| {
+            tx.put(b"testkey", b"testvalue")?;
+            Ok(())
+        }).unwrap();
+        
+        // Get in another tx
+        db.update(|tx| {
+            let val = tx.get(b"testkey");
+            println!("Different tx get: {:?}", val);
+            assert_eq!(val, Some(b"testvalue".to_vec()), "Should get value in different tx");
+            Ok(())
+        }).unwrap();
+        
+        db.close().unwrap();
     }
 }

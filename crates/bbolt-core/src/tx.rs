@@ -119,7 +119,7 @@ impl Tx {
     /// Get a bucket by name (empty name returns root bucket)
     pub fn bucket(&self, name: &[u8]) -> Option<Bucket> {
         if name.is_empty() {
-            Some(Bucket::with_db(*self.meta.root(), self.db.clone()))
+            Some(Bucket::with_writable(*self.meta.root(), self.db.clone(), self.writable))
         } else {
             self.root.get_bucket(name)
         }
@@ -141,6 +141,14 @@ impl Tx {
             return Err(Error::TxNotWritable);
         }
         self.root.put(key, value)
+    }
+
+    /// Create a new bucket at the root level
+    pub fn create_bucket(&mut self, key: &[u8]) -> Result<Bucket> {
+        if !self.writable {
+            return Err(Error::TxNotWritable);
+        }
+        self.root.create_bucket(key)
     }
 
     /// Delete a value
@@ -470,6 +478,10 @@ impl Tx {
         
         // Write freelist to its dedicated page
         self.write_freelist()?;
+        
+        // Sync all changes to disk
+        self.db.sync_to_disk()?;
+        
         Ok(())
     }
     
@@ -595,6 +607,8 @@ pub struct TxDatabase {
     pages: std::sync::Arc<std::sync::Mutex<HashMap<Pgid, Vec<u8>>>>,
     /// Next available page ID
     next_pgid: Pgid,
+    /// File path for syncing
+    path: std::sync::RwLock<Option<std::path::PathBuf>>,
 }
 
 impl Clone for TxDatabase {
@@ -605,16 +619,27 @@ impl Clone for TxDatabase {
             data: std::sync::Mutex::new(self.data.lock().unwrap().clone()),
             pages: self.pages.clone(),
             next_pgid: self.next_pgid,
+            path: std::sync::RwLock::new(self.path.read().unwrap().clone()),
         }
     }
 }
 
 impl TxDatabase {
     /// Create from existing database
-    pub fn new(page_size: usize, meta: Meta, data: Vec<u8>) -> Self {
+    pub fn new(page_size: usize, meta: Meta, data: Vec<u8>, path: Option<std::path::PathBuf>) -> Self {
         let pages = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
         let next_pgid = meta.pgid.max(4); // Start from page 4 (0=meta0, 1=meta1, 2=freelist, 3=root)
-        Self { page_size, meta, data: std::sync::Mutex::new(data), pages, next_pgid }
+        Self { page_size, meta, data: std::sync::Mutex::new(data), pages, next_pgid, path: std::sync::RwLock::new(path) }
+    }
+    
+    /// Set the file path
+    pub fn set_path(&self, path: std::path::PathBuf) {
+        *self.path.write().unwrap() = Some(path);
+    }
+    
+    /// Get the file path
+    pub fn path(&self) -> Option<std::path::PathBuf> {
+        self.path.read().unwrap().clone()
     }
     
 
@@ -701,6 +726,25 @@ impl TxDatabase {
     pub fn get_data(&self) -> Vec<u8> {
         self.data.lock().unwrap().clone()
     }
+    
+    /// Sync data to a file
+    pub fn sync_to_file<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
+        use std::io::Write;
+        let data = self.data.lock().unwrap();
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+        Ok(())
+    }
+    
+    /// Sync all dirty pages to disk using the stored path
+    pub fn sync_to_disk(&self) -> std::io::Result<()> {
+        if let Some(ref path) = *self.path.read().unwrap() {
+            self.sync_to_file(path)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -726,7 +770,7 @@ mod tests {
         // Page 0 and 1 are meta pages, will be overwritten
         // Pages 2-4 are data
 
-        let db = TxDatabase::new(page_size, meta, data);
+        let db = TxDatabase::new(page_size, meta, data, None);
         let tx = Tx::begin(db, false).unwrap();
 
         // Test write_to
@@ -755,7 +799,7 @@ mod tests {
         );
 
         let data = vec![0u8; page_size * 5];
-        let db = TxDatabase::new(page_size, meta, data);
+        let db = TxDatabase::new(page_size, meta, data, None);
         let mut tx = Tx::begin(db, false).unwrap();
 
         // Test copy
@@ -777,7 +821,7 @@ mod tests {
         );
 
         let data = vec![0u8; page_size * 5];
-        let db = TxDatabase::new(page_size, meta, data);
+        let db = TxDatabase::new(page_size, meta, data, None);
         let tx = Tx::begin(db, false).unwrap();
 
         // Create temp file
@@ -817,7 +861,7 @@ mod tests {
         data[3 * page_size + 8..3 * page_size + 10].copy_from_slice(&PageFlags::LEAF_PAGE_FLAG.bits().to_le_bytes());
         data[3 * page_size + 10..3 * page_size + 12].copy_from_slice(&2u16.to_le_bytes()); // count = 2
 
-        let db = TxDatabase::new(page_size, meta, data);
+        let db = TxDatabase::new(page_size, meta, data, None);
         let tx = Tx::begin(db, false).unwrap();
 
         // Page 0 (meta) should return info
@@ -856,7 +900,7 @@ mod tests {
 
         let data = vec![0u8; page_size * 6];
 
-        let db = TxDatabase::new(page_size, meta, data);
+        let db = TxDatabase::new(page_size, meta, data, None);
         let tx = Tx::begin(db, false).unwrap();
 
         // Add page 3 to free list
@@ -884,7 +928,7 @@ mod tests {
         );
 
         let data = vec![0u8; page_size * 5];
-        let db = TxDatabase::new(page_size, meta, data);
+        let db = TxDatabase::new(page_size, meta, data, None);
         let tx = Tx::begin(db, false).unwrap();
 
         let mut buf = Vec::new();
@@ -940,7 +984,7 @@ mod tests {
         );
 
         let data = vec![0u8; page_size * 5];
-        let db = TxDatabase::new(page_size, meta, data);
+        let db = TxDatabase::new(page_size, meta, data, None);
         let mut tx = Tx::begin(db, false).unwrap();
 
         // Test WriteTo trait implementation
@@ -970,7 +1014,7 @@ mod tests {
         );
 
         let data = vec![0u8; page_size * 5];
-        let db = TxDatabase::new(page_size, meta, data);
+        let db = TxDatabase::new(page_size, meta, data, None);
         let tx = Tx::begin(db, false).unwrap();
 
         let inspect = tx.inspect();
@@ -990,7 +1034,7 @@ mod tests {
         );
 
         let data = vec![0u8; page_size * 5];
-        let db = TxDatabase::new(page_size, meta, data);
+        let db = TxDatabase::new(page_size, meta, data, None);
         let tx = Tx::begin(db, true).unwrap();
 
         let inspect = tx.inspect();
@@ -1009,7 +1053,7 @@ mod tests {
         );
 
         let data = vec![0u8; page_size * 5];
-        let db = TxDatabase::new(page_size, meta, data);
+        let db = TxDatabase::new(page_size, meta, data, None);
         let tx = Tx::begin(db, false).unwrap();
 
         let mut pages_visited = Vec::new();
@@ -1033,7 +1077,7 @@ mod tests {
         );
 
         let data = vec![0u8; page_size * 5];
-        let db = TxDatabase::new(page_size, meta, data);
+        let db = TxDatabase::new(page_size, meta, data, None);
         let tx = Tx::begin(db, false).unwrap();
 
         let mut count = 0;
@@ -1057,7 +1101,7 @@ mod tests {
         );
 
         let data = vec![0u8; page_size * 5];
-        let tx_db = TxDatabase::new(page_size, meta, data);
+        let tx_db = TxDatabase::new(page_size, meta, data, None);
         let tx = Tx::begin(tx_db, false).unwrap();
 
         // Tx::db() should return the TxDatabase
@@ -1077,7 +1121,7 @@ mod tests {
         );
 
         let data = vec![0u8; page_size * 5];
-        let tx_db = TxDatabase::new(page_size, meta, data);
+        let tx_db = TxDatabase::new(page_size, meta, data, None);
         let tx = Tx::begin(tx_db, false).unwrap();
 
         // Tx::size() should return the data size

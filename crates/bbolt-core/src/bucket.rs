@@ -62,7 +62,7 @@ impl Bucket {
     pub fn new(inbucket: &crate::page::InBucket) -> Self {
         Self {
             inbucket: *inbucket,
-            db: TxDatabase::new(4096, Meta::default(), vec![]),
+            db: TxDatabase::new(4096, Meta::default(), vec![], None),
             root_pgid: inbucket.root_pgid(),
             fill_percent: DEFAULT_FILL_PERCENT,
             writable: false,
@@ -1078,7 +1078,7 @@ mod tests {
     fn create_test_bucket() -> Bucket {
         // Create a simple bucket with no root page
         let meta = Meta::default();
-        let db = TxDatabase::new(4096, meta, vec![]);
+        let db = TxDatabase::new(4096, meta, vec![], None);
         Bucket::with_db(crate::page::InBucket::new(0, 0), db)
     }
 
@@ -1130,7 +1130,7 @@ mod tests {
         // Value data (at page offset 36)
         data[page_offset + 36..page_offset + 42].copy_from_slice(b"value1");
 
-        let db = TxDatabase::new(page_size, meta, data);
+        let db = TxDatabase::new(page_size, meta, data, None);
         Bucket::with_db(crate::page::InBucket::new(1, 0), db)
     }
 
@@ -1218,7 +1218,7 @@ mod tests {
         data[page_offset + 10..page_offset + 12].copy_from_slice(&0u16.to_le_bytes()); // empty
         data[page_offset + 12..page_offset + 16].copy_from_slice(&0u32.to_le_bytes());
         
-        let db = TxDatabase::new(page_size, meta, data);
+        let db = TxDatabase::new(page_size, meta, data, None);
         let mut bucket = Bucket::with_db(crate::page::InBucket::new(1, 0), db);
         bucket.set_writable(true);
         bucket
