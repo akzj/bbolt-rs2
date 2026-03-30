@@ -46,6 +46,80 @@ pub struct TxStats {
     pub write_time_ms: i64,
 }
 
+impl TxStats {
+    /// Get page count
+    pub fn get_page_count(&self) -> i64 {
+        self.page_count
+    }
+
+    /// Get cursor count
+    pub fn get_cursor_count(&self) -> i64 {
+        self.cursor_count
+    }
+
+    /// Get node count
+    pub fn get_node_count(&self) -> i64 {
+        self.node_count
+    }
+
+    /// Get rebalance count
+    pub fn get_rebalance_count(&self) -> i64 {
+        self.rebalance
+    }
+
+    /// Get rebalance time in milliseconds
+    pub fn get_rebalance_time(&self) -> i64 {
+        self.rebalance_time_ms
+    }
+
+    /// Get split count
+    pub fn get_split_count(&self) -> i64 {
+        self.split
+    }
+
+    /// Get spill count
+    pub fn get_spill_count(&self) -> i64 {
+        self.spill
+    }
+
+    /// Get write count
+    pub fn get_write_count(&self) -> i64 {
+        self.write_time_ms
+    }
+
+    /// Add another TxStats to this one
+    pub fn add(&mut self, other: &TxStats) {
+        self.page_count += other.page_count;
+        self.page_alloc += other.page_alloc;
+        self.cursor_count += other.cursor_count;
+        self.node_count += other.node_count;
+        self.node_deref += other.node_deref;
+        self.rebalance += other.rebalance;
+        self.rebalance_time_ms += other.rebalance_time_ms;
+        self.split += other.split;
+        self.spill += other.spill;
+        self.spill_time_ms += other.spill_time_ms;
+        self.write_time_ms += other.write_time_ms;
+    }
+
+    /// Subtract another TxStats from this one
+    pub fn sub(&self, other: &TxStats) -> TxStats {
+        TxStats {
+            page_count: self.page_count - other.page_count,
+            page_alloc: self.page_alloc - other.page_alloc,
+            cursor_count: self.cursor_count - other.cursor_count,
+            node_count: self.node_count - other.node_count,
+            node_deref: self.node_deref - other.node_deref,
+            rebalance: self.rebalance - other.rebalance,
+            rebalance_time_ms: self.rebalance_time_ms - other.rebalance_time_ms,
+            split: self.split - other.split,
+            spill: self.spill - other.spill,
+            spill_time_ms: self.spill_time_ms - other.spill_time_ms,
+            write_time_ms: self.write_time_ms - other.write_time_ms,
+        }
+    }
+}
+
 /// Transaction represents a read-only or read-write database transaction
 pub struct Tx {
     /// Whether this is a writable transaction

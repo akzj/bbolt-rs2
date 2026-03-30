@@ -56,6 +56,27 @@ pub struct BucketStats {
     /// Bytes used for inline buckets
     pub inline_bucket_inuse: usize,
 }
+impl BucketStats {
+    /// Add another BucketStats to this one and return a new BucketStats
+    pub fn add(&self, other: &BucketStats) -> BucketStats {
+        BucketStats {
+            branch_page_count: self.branch_page_count + other.branch_page_count,
+            branch_overflow_count: self.branch_overflow_count + other.branch_overflow_count,
+            leaf_page_count: self.leaf_page_count + other.leaf_page_count,
+            leaf_overflow_count: self.leaf_overflow_count + other.leaf_overflow_count,
+            key_count: self.key_count + other.key_count,
+            depth: self.depth.max(other.depth),
+            branch_alloc: self.branch_alloc + other.branch_alloc,
+            branch_inuse: self.branch_inuse + other.branch_inuse,
+            leaf_alloc: self.leaf_alloc + other.leaf_alloc,
+            leaf_inuse: self.leaf_inuse + other.leaf_inuse,
+            bucket_count: self.bucket_count + other.bucket_count,
+            inline_bucket_count: self.inline_bucket_count + other.inline_bucket_count,
+            inline_bucket_inuse: self.inline_bucket_inuse + other.inline_bucket_inuse,
+        }
+    }
+}
+
 
 impl Bucket {
     /// Create a new bucket
@@ -1456,5 +1477,57 @@ mod tests {
         
         assert_eq!(stats.key_count, 2, "Should have 2 keys");
         assert!(stats.leaf_page_count >= 1, "Should have at least 1 leaf page");
+    }
+
+    #[test]
+    fn test_bucket_stats_add() {
+        // Hypothesis: BucketStats::add() should correctly sum two stats
+        let stats1 = BucketStats {
+            branch_page_count: 2,
+            branch_overflow_count: 1,
+            leaf_page_count: 3,
+            leaf_overflow_count: 0,
+            key_count: 10,
+            depth: 2,
+            branch_alloc: 8192,
+            branch_inuse: 4000,
+            leaf_alloc: 12288,
+            leaf_inuse: 8000,
+            bucket_count: 3,
+            inline_bucket_count: 1,
+            inline_bucket_inuse: 100,
+        };
+
+        let stats2 = BucketStats {
+            branch_page_count: 1,
+            branch_overflow_count: 0,
+            leaf_page_count: 2,
+            leaf_overflow_count: 1,
+            key_count: 5,
+            depth: 3,
+            branch_alloc: 4096,
+            branch_inuse: 2000,
+            leaf_alloc: 8192,
+            leaf_inuse: 5000,
+            bucket_count: 2,
+            inline_bucket_count: 0,
+            inline_bucket_inuse: 0,
+        };
+
+        let combined = stats1.add(&stats2);
+
+        assert_eq!(combined.branch_page_count, 3, "branch_page_count should sum");
+        assert_eq!(combined.branch_overflow_count, 1, "branch_overflow_count should sum");
+        assert_eq!(combined.leaf_page_count, 5, "leaf_page_count should sum");
+        assert_eq!(combined.leaf_overflow_count, 1, "leaf_overflow_count should sum");
+        assert_eq!(combined.key_count, 15, "key_count should sum");
+        assert_eq!(combined.depth, 3, "depth should be max of both");
+        assert_eq!(combined.branch_alloc, 12288, "branch_alloc should sum");
+        assert_eq!(combined.branch_inuse, 6000, "branch_inuse should sum");
+        assert_eq!(combined.leaf_alloc, 20480, "leaf_alloc should sum");
+        assert_eq!(combined.leaf_inuse, 13000, "leaf_inuse should sum");
+        assert_eq!(combined.bucket_count, 5, "bucket_count should sum");
+        assert_eq!(combined.inline_bucket_count, 1, "inline_bucket_count should sum");
+        assert_eq!(combined.inline_bucket_inuse, 100, "inline_bucket_inuse should sum");
     }
 }
