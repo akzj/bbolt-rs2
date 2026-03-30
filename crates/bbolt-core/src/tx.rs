@@ -115,6 +115,11 @@ impl Tx {
     pub fn cursor(&self) -> crate::cursor::Cursor {
         self.root.cursor()
     }
+    
+    /// Get a reference to the root bucket
+    pub fn root(&self) -> &Bucket {
+        &self.root
+    }
 
     /// Get a bucket by name (empty name returns root bucket)
     pub fn bucket(&self, name: &[u8]) -> Option<Bucket> {
@@ -123,6 +128,19 @@ impl Tx {
         } else {
             self.root.get_bucket(name)
         }
+    }
+    
+    /// Iterate over all root-level buckets (created via create_bucket)
+    /// Returns iterator of (name, Bucket) pairs
+    pub fn buckets(&self) -> Vec<(Vec<u8>, Bucket)> {
+        let mut result = Vec::new();
+        if let Err(e) = self.root.for_each_bucket(|name, bucket| {
+            result.push((name.to_vec(), bucket));
+            Ok(())
+        }) {
+            // Ignore errors, return what we have
+        }
+        result
     }
 
     /// Get a value from the root bucket

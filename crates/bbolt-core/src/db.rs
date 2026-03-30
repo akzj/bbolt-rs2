@@ -132,8 +132,8 @@ pub struct CompactOptions {
     pub compaction: bool,
     /// Skip freelist sync
     pub tmp_no_freelist_sync: bool,
-    /// Parallel transactions
-    pub parallel_tx: bool,
+    /// Parallel transactions (txMaxSize in Go)
+    pub tx_max_size: i64,
 }
 
 impl Default for CompactOptions {
@@ -141,7 +141,7 @@ impl Default for CompactOptions {
         Self {
             compaction: true,
             tmp_no_freelist_sync: false,
-            parallel_tx: false,
+            tx_max_size: 0, // 0 means ignore transaction size
         }
     }
 }
@@ -828,19 +828,103 @@ impl Db {
     }
 
     /// Compact the database by creating a compacted copy at the destination path.
-    /// Uses std::fs::copy for a simple file copy (basic compaction).
-    pub fn compact(&self, path: &Path, _options: &CompactOptions) -> Result<Arc<Self>> {
-        use std::fs;
+    /// Uses walk-based compaction similar to Go bbolt's Compact function.
+    pub fn compact(&self, path: &Path, options: &CompactOptions) -> Result<Arc<Self>> {
+        // Open destination database
+        let dst_db = Self::open(path, Options::default())?;
         
-        // Copy the database file directly
-        fs::copy(self.path(), path)?;
+        // Use write transaction to copy all data
+        let tx_max_size = options.tx_max_size;
+        let mut size: i64 = 0;
+        let mut dst_tx = dst_db.begin(true)?;
         
-        // Open and return the compacted database
-        let result = Self::open(path, Options::default())?;
-        Ok(result)
+        // Walk all buckets in source and copy to destination
+        self.view(|src_tx| {
+            Self::walk_buckets(src_tx, &[], |keys, k, v, seq| {
+                // Check if we need to commit due to transaction size
+                let sz = (k.len() + v.len()) as i64;
+                if tx_max_size > 0 && size + sz > tx_max_size {
+                    dst_tx.commit()?;
+                    dst_tx = dst_db.begin(true)?;
+                    size = 0;
+                }
+                size += sz;
+                
+                // Handle root level (create bucket)
+                if keys.is_empty() {
+                    let mut bucket = dst_tx.create_bucket(k)?;
+                    bucket.set_sequence(seq)?;
+                    return Ok(());
+                }
+                
+                // Navigate to destination bucket
+                let mut dst_bucket = dst_tx.bucket(keys[0]).ok_or(Error::BucketNotFound)?;
+                for key in &keys[1..] {
+                    dst_bucket = dst_bucket.get_bucket(key).ok_or(Error::BucketNotFound)?;
+                }
+                
+                // If v is empty, this is a bucket
+                if v.is_empty() {
+                    let mut sub_bucket = dst_bucket.create_bucket(k)?;
+                    sub_bucket.set_sequence(seq)?;
+                    return Ok(());
+                }
+                
+                // Otherwise it's a key-value pair
+                dst_bucket.put(k, v)?;
+                Ok(())
+            })
+        })?;
+        
+        dst_tx.commit()?;
+        Ok(dst_db)
+    }
+    
+    /// Walk all buckets recursively, calling the callback for each key/value
+    fn walk_buckets<F>(tx: &Tx, keys: &[&[u8]], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[&[u8]], &[u8], &[u8], u64) -> Result<()>,
+    {
+        // Iterate over root buckets
+        tx.root().for_each_bucket(&mut |name: &[u8], bucket: Bucket| {
+            let seq = bucket.sequence();
+            
+            // Callback for root bucket
+            f(keys, name, &[], seq)?;
+            
+            // Walk this bucket's contents recursively
+            Self::walk_bucket(&bucket, &[name], &mut f)?;
+            Ok(())
+        })
+    }
+    
+    /// Walk a bucket's contents recursively
+    fn walk_bucket<F>(bucket: &Bucket, keypath: &[&[u8]], f: &mut F) -> Result<()>
+    where
+        F: FnMut(&[&[u8]], &[u8], &[u8], u64) -> Result<()>,
+    {
+        let mut cursor = bucket.cursor();
+        while let Some((k, v)) = cursor.next() {
+            // Check if this is a bucket (value is a sub-bucket reference)
+            if let Some(sub_bucket) = bucket.get_bucket(&k) {
+                // This is a sub-bucket
+                let seq = sub_bucket.sequence();
+                f(keypath, &k, &[], seq)?;
+                
+                // Recurse into sub-bucket
+                let mut new_path = keypath.to_vec();
+                new_path.push(&k);
+                Self::walk_bucket(&sub_bucket, &new_path, f)?;
+            } else {
+                // Regular key-value
+                f(keypath, &k, &v, bucket.sequence())?;
+            }
+        }
+        Ok(())
     }
     
     /// Copy all entries from source bucket to destination bucket
+    #[allow(dead_code)]
     fn copy_bucket(dst_tx: &mut Tx, src_bucket: &Bucket, dst_bucket: &mut Bucket) -> Result<()> {
         use crate::constants::LeafFlags;
         
