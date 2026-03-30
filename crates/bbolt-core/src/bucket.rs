@@ -318,6 +318,65 @@ impl Bucket {
         Ok(())
     }
     
+    /// MoveBucket moves a sub-bucket from this bucket to the destination bucket.
+    /// Returns an error if:
+    /// 1. the sub-bucket cannot be found in the source bucket;
+    /// 2. the key already exists in the destination bucket;
+    /// 3. the key represents a non-bucket value;
+    /// 4. the source and destination buckets are the same.
+    pub fn move_bucket(&mut self, key: &[u8], dst: &mut Bucket) -> Result<()> {
+        // Check if both buckets are writable
+        if !self.writable {
+            return Err(Error::TxNotWritable);
+        }
+        if !dst.writable {
+            return Err(Error::TxNotWritable);
+        }
+        
+        // Check if both buckets are in the same transaction
+        // (by comparing their root pages and tx database)
+        if self.root_page() == dst.root_page() && self.root_page() != 0 {
+            return Err(Error::SameBuckets);
+        }
+        
+        // Find the bucket in source using cursor
+        let mut cursor = self.cursor();
+        let result = cursor.seek(key);
+        
+        let (k, v, flags) = match result {
+            Some(r) => r,
+            None => return Err(Error::BucketNotFound),
+        };
+        
+        if k != key {
+            return Err(Error::BucketNotFound);
+        }
+        if flags & LeafFlags::BUCKET_LEAF_FLAG.bits() == 0 {
+            return Err(Error::IncompatibleValue);
+        }
+        
+        // Check if key already exists in destination
+        let mut dst_cursor = dst.cursor();
+        let dst_result = dst_cursor.seek(key);
+        
+        if let Some((dk, _, dst_flags)) = dst_result {
+            if dk == key {
+                if dst_flags & LeafFlags::BUCKET_LEAF_FLAG.bits() != 0 {
+                    return Err(Error::BucketExists);
+                }
+                return Err(Error::IncompatibleValue);
+            }
+        }
+        
+        // Delete from source
+        self.delete(key)?;
+        
+        // Put into destination with BUCKET_LEAF_FLAG preserved
+        dst.put_with_flags(key, &v, LeafFlags::BUCKET_LEAF_FLAG.bits())?;
+        
+        Ok(())
+    }
+    
 
 
     /// Get a value by key
@@ -1529,5 +1588,129 @@ mod tests {
         assert_eq!(combined.bucket_count, 5, "bucket_count should sum");
         assert_eq!(combined.inline_bucket_count, 1, "inline_bucket_count should sum");
         assert_eq!(combined.inline_bucket_inuse, 100, "inline_bucket_inuse should sum");
+    }
+
+    /// Create two buckets sharing the same TxDatabase but with different root pages
+    fn create_two_writable_buckets() -> (Bucket, Bucket) {
+        let page_size = 4096;
+        let mut data = vec![0u8; page_size * 5]; // 5 pages
+        
+        // Meta page at offset 0 with root_pgid=1
+        let meta = Meta::new(page_size as u32, 0, crate::page::InBucket::new(1, 0), 5, 0);
+        data[0..8].copy_from_slice(&0u64.to_le_bytes());
+        data[8..10].copy_from_slice(&PageFlags::META_PAGE_FLAG.bits().to_le_bytes());
+        data[10..12].copy_from_slice(&0u16.to_le_bytes());
+        data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        
+        let meta_offset = 16;
+        data[meta_offset..meta_offset + 4].copy_from_slice(&meta.magic.to_le_bytes());
+        data[meta_offset + 4..meta_offset + 8].copy_from_slice(&meta.version.to_le_bytes());
+        data[meta_offset + 8..meta_offset + 12].copy_from_slice(&meta.page_size.to_le_bytes());
+        data[meta_offset + 12..meta_offset + 16].copy_from_slice(&meta.flags.to_le_bytes());
+        data[meta_offset + 16..meta_offset + 24].copy_from_slice(&meta.root.root.to_le_bytes());
+        data[meta_offset + 24..meta_offset + 32].copy_from_slice(&meta.root.sequence.to_le_bytes());
+        data[meta_offset + 32..meta_offset + 40].copy_from_slice(&meta.freelist.to_le_bytes());
+        data[meta_offset + 40..meta_offset + 48].copy_from_slice(&meta.pgid.to_le_bytes());
+        data[meta_offset + 48..meta_offset + 56].copy_from_slice(&meta.txid.to_le_bytes());
+        data[meta_offset + 56..meta_offset + 64].copy_from_slice(&meta.checksum.to_le_bytes());
+        
+        // Root leaf page 1 at offset 4096
+        data[page_size..page_size + 8].copy_from_slice(&1u64.to_le_bytes());
+        data[page_size + 8..page_size + 10].copy_from_slice(&PageFlags::LEAF_PAGE_FLAG.bits().to_le_bytes());
+        data[page_size + 10..page_size + 12].copy_from_slice(&0u16.to_le_bytes());
+        data[page_size + 12..page_size + 16].copy_from_slice(&0u32.to_le_bytes());
+        
+        // Root leaf page 2 at offset 8192
+        data[page_size * 2..page_size * 2 + 8].copy_from_slice(&2u64.to_le_bytes());
+        data[page_size * 2 + 8..page_size * 2 + 10].copy_from_slice(&PageFlags::LEAF_PAGE_FLAG.bits().to_le_bytes());
+        data[page_size * 2 + 10..page_size * 2 + 12].copy_from_slice(&0u16.to_le_bytes());
+        data[page_size * 2 + 12..page_size * 2 + 16].copy_from_slice(&0u32.to_le_bytes());
+        
+        // Create shared TxDatabase
+        let db = TxDatabase::new(page_size, meta, data, None);
+        
+        // Create both buckets with the SAME db but different root pages
+        let mut bucket1 = Bucket::with_db(crate::page::InBucket::new(1, 0), db.clone());
+        bucket1.set_writable(true);
+        
+        let mut bucket2 = Bucket::with_db(crate::page::InBucket::new(2, 0), db);
+        bucket2.set_writable(true);
+        
+        (bucket1, bucket2)
+    }
+
+    #[test]
+    fn test_shared_db_put_get() {
+        // Test that put in bucket1 can be read from bucket1
+        let (mut bucket1, _bucket2) = create_two_writable_buckets();
+        
+        bucket1.put(b"testkey", b"testvalue").unwrap();
+        let val = bucket1.get(b"testkey");
+        assert_eq!(val, Some(b"testvalue".to_vec()), "bucket1.get should work after put");
+    }
+
+    #[test]
+    fn test_same_bucket_put_get() {
+        // Test that put in same bucket can be read back (basic sanity check)
+        let (mut bucket1, _bucket2) = create_two_writable_buckets();
+        
+        bucket1.put(b"testkey", b"testvalue").unwrap();
+        let val = bucket1.get(b"testkey");
+        assert_eq!(val, Some(b"testvalue".to_vec()), "bucket1 should see its own put");
+    }
+
+    #[test]
+    fn test_move_bucket() {
+        // Create two writable buckets sharing the same TxDatabase
+        let (mut bucket1, mut bucket2) = create_two_writable_buckets();
+        
+        // Create a sub-bucket in bucket1
+        let sub_key = b"subbucket";
+        let mut sub_bucket = bucket1.create_bucket(sub_key).unwrap();
+        sub_bucket.set_writable(true);
+        sub_bucket.put(b"key1", b"value1").unwrap();
+        
+        // Verify sub-bucket exists in bucket1
+        assert!(bucket1.get_bucket(sub_key).is_some(), "sub-bucket should exist in bucket1");
+        
+        // Move the sub-bucket from bucket1 to bucket2
+        bucket1.move_bucket(sub_key, &mut bucket2).unwrap();
+        
+        // Verify sub-bucket no longer exists in bucket1
+        assert!(bucket1.get_bucket(sub_key).is_none(), "sub-bucket should not exist in bucket1 after move");
+        
+        // Verify sub-bucket exists in bucket2
+        assert!(bucket2.get_bucket(sub_key).is_some(), "sub-bucket should exist in bucket2 after move");
+        
+        // Verify data is preserved
+        let moved_bucket = bucket2.get_bucket(sub_key).unwrap();
+        assert_eq!(moved_bucket.get(b"key1"), Some(b"value1".to_vec()));
+    }
+
+    #[test]
+    fn test_move_bucket_not_found() {
+        use crate::errors::Error;
+        
+        let (mut bucket1, mut bucket2) = create_two_writable_buckets();
+        
+        let result = bucket1.move_bucket(b"nonexistent", &mut bucket2);
+        assert!(matches!(result, Err(Error::BucketNotFound)));
+    }
+
+    #[test]
+    fn test_move_bucket_already_exists() {
+        use crate::errors::Error;
+        
+        let (mut bucket1, mut bucket2) = create_two_writable_buckets();
+        
+        // Create sub-bucket in bucket1
+        bucket1.create_bucket(b"subbucket").unwrap();
+        
+        // Create sub-bucket in bucket2 with same name
+        bucket2.create_bucket(b"subbucket").unwrap();
+        
+        // Moving should fail with BucketExists
+        let result = bucket1.move_bucket(b"subbucket", &mut bucket2);
+        assert!(matches!(result, Err(Error::BucketExists)));
     }
 }

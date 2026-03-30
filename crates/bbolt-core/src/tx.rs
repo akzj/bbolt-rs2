@@ -262,6 +262,35 @@ impl Tx {
         self.root.delete(key)
     }
 
+    /// MoveBucket moves a sub-bucket from the source bucket to the destination bucket.
+    /// Returns an error if:
+    /// 1. the sub-bucket cannot be found in the source bucket;
+    /// 2. the key already exists in the destination bucket;
+    /// 3. the key represents a non-bucket value;
+    /// 4. the source and destination buckets are the same.
+    ///
+    /// If src is None, it means moving from the root bucket.
+    /// If dst is None, it means moving to the root bucket.
+    pub fn move_bucket(&mut self, key: &[u8], src: Option<&mut Bucket>, dst: Option<&mut Bucket>) -> Result<()> {
+        if !self.writable {
+            return Err(Error::TxNotWritable);
+        }
+        
+        // If both are None, they're the same bucket (root)
+        if src.is_none() && dst.is_none() {
+            return Err(Error::SameBuckets);
+        }
+        
+        // If src is None, use root; if dst is None, use root
+        // These cannot both be None due to the check above
+        match (src, dst) {
+            (Some(src_b), Some(dst_b)) => src_b.move_bucket(key, dst_b),
+            (Some(src_b), None) => src_b.move_bucket(key, &mut self.root),
+            (None, Some(dst_b)) => self.root.move_bucket(key, dst_b),
+            (None, None) => unreachable!(), // Already handled above
+        }
+    }
+
     /// Get page data
     pub fn page_data(&self, pgid: Pgid) -> Option<Vec<u8>> {
         // Check dirty pages first
