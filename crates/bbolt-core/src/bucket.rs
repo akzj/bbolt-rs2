@@ -128,42 +128,66 @@ impl Bucket {
     
     /// Get nested bucket instance
     pub fn get_bucket(&self, name: &[u8]) -> Option<Bucket> {
-        if let Some(value) = self.bucket(name) {
-            // Go bbolt stores bucket values as:
-            // [InBucket header (16 bytes)][optional inline page data]
-            // InBucket: root_pgid(8) + sequence(8) = 16 bytes
-            
-            if value.len() >= 16 {
-                let root_pgid = Pgid::from_le_bytes([
-                    value[0], value[1], value[2], value[3],
-                    value[4], value[5], value[6], value[7]
-                ]);
-                let sequence = u64::from_le_bytes([
-                    value[8], value[9], value[10], value[11],
-                    value[12], value[13], value[14], value[15]
-                ]);
-                let inbucket = crate::page::InBucket::new(root_pgid, sequence);
-                
-                // Check if this is an inline bucket (root_pgid == 0 and has page data)
-                if root_pgid == 0 && value.len() > 16 {
-                    // Extract inline page data from value[16:]
-                    let inline_data = value[16..].to_vec();
-                    return Some(Bucket::with_inline_data(inbucket, self.db.clone(), inline_data));
-                }
-                
-                return Some(Bucket::with_db(inbucket, self.db.clone()));
-            }
+        if name.is_empty() {
+            return None;
         }
-        None
+        
+        // Empty bucket
+        if self.root_pgid == 0 {
+            return None;
+        }
+        
+        // Use cursor to find the bucket entry
+        let mut cursor = self.cursor();
+        let result = cursor.seek(name)?;
+        
+        let (k, v, flags) = result;
+        
+        // Check if key matches and is a bucket entry
+        if k != name {
+            return None;
+        }
+        if flags & LeafFlags::BUCKET_LEAF_FLAG.bits() == 0 {
+            return None;
+        }
+        
+        // Parse InBucket from value
+        if v.len() < 16 {
+            return None;
+        }
+        
+        let root_pgid = Pgid::from_le_bytes([
+            v[0], v[1], v[2], v[3],
+            v[4], v[5], v[6], v[7]
+        ]);
+        let sequence = u64::from_le_bytes([
+            v[8], v[9], v[10], v[11],
+            v[12], v[13], v[14], v[15]
+        ]);
+        let inbucket = crate::page::InBucket::new(root_pgid, sequence);
+        
+        // Check if this is an inline bucket (root_pgid == 0 and has page data)
+        if root_pgid == 0 && v.len() > 16 {
+            // Extract inline page data from value[16:]
+            let inline_data = v[16..].to_vec();
+            return Some(Bucket::with_inline_data(inbucket, self.db.clone(), inline_data));
+        }
+        
+        Some(Bucket::with_db(inbucket, self.db.clone()))
     }
 
     /// Create a new nested bucket
-    pub fn create_bucket(&mut self, key: &[u8]) -> Result<&mut Bucket> {
+    pub fn create_bucket(&mut self, key: &[u8]) -> Result<Bucket> {
         if !self.writable {
             return Err(Error::TxNotWritable);
         }
         if key.is_empty() {
-            return Err(Error::KeyRequired);
+            return Err(Error::BucketNameRequired);
+        }
+        
+        // Check if bucket already exists
+        if self.get_bucket(key).is_some() {
+            return Err(Error::BucketExists);
         }
         
         // Allocate a new page for the bucket's root
@@ -189,15 +213,58 @@ impl Bucket {
         inbucket_data[8..16].copy_from_slice(&inbucket.sequence().to_le_bytes());
         
         // Insert bucket entry with BUCKET_LEAF_FLAG
-        // For nested buckets, we just put the InBucket data as value
-        // The flag will be set when the bucket is written
-        self.put(key, &inbucket_data)?;
+        self.put_with_flags(key, &inbucket_data, LeafFlags::BUCKET_LEAF_FLAG.bits())?;
         
-        // Store the nested bucket in our in-memory map
-        let nested = Bucket::with_db(inbucket, self.db.clone());
+        // Return the created bucket
+        Ok(Bucket::with_db(inbucket, self.db.clone()))
+    }
+
+    /// Create a new nested bucket if it doesn't exist
+    pub fn create_bucket_if_not_exists(&mut self, key: &[u8]) -> Result<Bucket> {
+        if !self.writable {
+            return Err(Error::TxNotWritable);
+        }
+        if key.is_empty() {
+            return Err(Error::BucketNameRequired);
+        }
         
-        // Return reference to the last inserted bucket
-        Err(Error::BucketExists) // Placeholder - actual return needs ref handling
+        // Check if bucket already exists
+        if let Some(bucket) = self.get_bucket(key) {
+            return Ok(bucket);
+        }
+        
+        self.create_bucket(key)
+    }
+
+    /// Delete a nested bucket
+    pub fn delete_bucket(&mut self, key: &[u8]) -> Result<()> {
+        if !self.writable {
+            return Err(Error::TxNotWritable);
+        }
+        if key.is_empty() {
+            return Err(Error::BucketNameRequired);
+        }
+        
+        // Find the bucket entry
+        let mut cursor = self.cursor();
+        let result = cursor.seek(key);
+        
+        let (k, _, flags) = match result {
+            Some(r) => r,
+            None => return Err(Error::BucketNotFound),
+        };
+        
+        if k != key {
+            return Err(Error::BucketNotFound);
+        }
+        if flags & LeafFlags::BUCKET_LEAF_FLAG.bits() == 0 {
+            return Err(Error::IncompatibleValue);
+        }
+        
+        // Delete the bucket entry
+        self.delete(key)?;
+        
+        Ok(())
     }
     
 
@@ -414,7 +481,7 @@ impl Bucket {
         self.put_with_alloc(key, value)
     }
 
-    fn put_with_alloc(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+    fn put_with_flags(&mut self, key: &[u8], value: &[u8], flags: u32) -> Result<()> {
         let (leaf_pgid, leaf_data, insert_index) = self.find_leaf_with_index(key)?;
         
         let page_size = self.db.page_size();
@@ -440,12 +507,9 @@ impl Bucket {
         }
         
         let new_count = if key_exists { count } else { count + 1 };
-        let mut data_end = elem_start + count * elem_size;
-        for &(pos, ksize, vsize) in &elems {
-            data_end = data_end.max(pos as usize + ksize as usize + vsize as usize);
-        }
-        let new_data_pos = data_end;
-        let new_data_end = new_data_pos + key.len() + value.len();
+        // Key-value data starts AFTER all element headers (not after existing data)
+        let new_kv_pos = elem_start + new_count * elem_size;
+        let new_data_end = new_kv_pos + key.len() + value.len();
         if new_data_end > page_size {
             return Err(Error::ValueTooLarge);
         }
@@ -456,7 +520,7 @@ impl Bucket {
         
         let elem_to_skip = if key_exists { Some(existing_index) } else { None };
         
-        // Copy existing data to ORIGINAL positions
+        // Copy existing key-value data to ORIGINAL positions
         for (i, &(pos, ksize, vsize)) in elems.iter().enumerate() {
             if Some(i) == elem_to_skip { continue; }
             let pos = pos as usize; let ksize = ksize as usize; let vsize = vsize as usize;
@@ -464,13 +528,7 @@ impl Bucket {
             new_data[pos + ksize..pos + ksize + vsize].copy_from_slice(&leaf_data[pos + ksize..pos + ksize + vsize]);
         }
         
-        // Write new key-value data at END
-        if !key_exists {
-            new_data[new_data_pos..new_data_pos + key.len()].copy_from_slice(key);
-            new_data[new_data_pos + key.len()..new_data_pos + key.len() + value.len()].copy_from_slice(value);
-        }
-        
-        // Write ALL element headers
+        // Write ALL element headers FIRST
         let mut tgt_i = 0;
         for i in 0..count {
             if Some(i) == elem_to_skip { continue; }
@@ -486,14 +544,24 @@ impl Bucket {
         // Write new element header at insert_index
         if !key_exists {
             let new_elem_offset = elem_start + insert_index * elem_size;
-            new_data[new_elem_offset..new_elem_offset + 4].copy_from_slice(&0u32.to_le_bytes());
-            new_data[new_elem_offset + 4..new_elem_offset + 8].copy_from_slice(&(new_data_pos as u32).to_le_bytes());
+            new_data[new_elem_offset..new_elem_offset + 4].copy_from_slice(&flags.to_le_bytes());
+            new_data[new_elem_offset + 4..new_elem_offset + 8].copy_from_slice(&(new_kv_pos as u32).to_le_bytes());
             new_data[new_elem_offset + 8..new_elem_offset + 12].copy_from_slice(&(key.len() as u32).to_le_bytes());
             new_data[new_elem_offset + 12..new_elem_offset + 16].copy_from_slice(&(value.len() as u32).to_le_bytes());
         }
         
+        // Write new key-value data at the END (after all element headers are written)
+        if !key_exists {
+            new_data[new_kv_pos..new_kv_pos + key.len()].copy_from_slice(key);
+            new_data[new_kv_pos + key.len()..new_kv_pos + key.len() + value.len()].copy_from_slice(value);
+        }
+        
         self.db.get_pages().lock().unwrap().insert(leaf_pgid, new_data);
         Ok(())
+    }
+
+    fn put_with_alloc(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_with_flags(key, value, 0)
     }
 
     /// Find leaf page and insertion index for a key
@@ -569,30 +637,91 @@ impl Bucket {
 
     /// Delete a key from the B+tree
     fn delete_from_tree(&mut self, key: &[u8]) -> Result<()> {
-        // Find the key first
-        let (leaf_pgid, leaf_data, index) = self.find_leaf_with_index(key)?;
+        let (leaf_pgid, leaf_data, _insert_index) = self.find_leaf_with_index(key)?;
         
-        // Check if key exists
-        let page = self.page(leaf_pgid);
-        let elems = page.leaf_elements();
+        let page_size = self.db.page_size();
+        let elem_size = 16usize;
+        let elem_start = 16usize;
+        let count = u16::from_le_bytes([leaf_data[10], leaf_data[11]]) as usize;
         
-        let mut found_index = None;
-        for (i, elem) in elems.iter().enumerate() {
-            if elem.key(&leaf_data) == key {
-                if elem.flags & LeafFlags::BUCKET_LEAF_FLAG.bits() == 0 {
-                    found_index = Some(i);
-                    break;
-                }
+        // Find the element to delete
+        let mut del_index = None;
+        let mut del_pos = 0u32;
+        let mut del_ksize = 0u32;
+        let mut del_vsize = 0u32;
+        
+        for i in 0..count {
+            let elem_offset = elem_start + i * elem_size;
+            let pos = u32::from_le_bytes([leaf_data[elem_offset + 4], leaf_data[elem_offset + 5], leaf_data[elem_offset + 6], leaf_data[elem_offset + 7]]);
+            let ksize = u32::from_le_bytes([leaf_data[elem_offset + 8], leaf_data[elem_offset + 9], leaf_data[elem_offset + 10], leaf_data[elem_offset + 11]]);
+            let vsize = u32::from_le_bytes([leaf_data[elem_offset + 12], leaf_data[elem_offset + 13], leaf_data[elem_offset + 14], leaf_data[elem_offset + 15]]);
+            let elem_key = &leaf_data[pos as usize..pos as usize + ksize as usize];
+            
+            if elem_key == key {
+                del_index = Some(i);
+                del_pos = pos;
+                del_ksize = ksize;
+                del_vsize = vsize;
+                break;
             }
         }
-
-        if let Some(idx) = found_index {
-            // Delete would need page modification and potential merge
-            // For now, return success to indicate key was found
-            Ok(())
-        } else {
-            Ok(()) // Key not found, nothing to delete
+        
+        if del_index.is_none() {
+            return Ok(()); // Key not found
         }
+        
+        let dIdx = del_index.unwrap();
+        
+        // Build new page with element removed
+        let mut new_data = vec![0u8; page_size];
+        new_data[0..16].copy_from_slice(&leaf_data[0..16]);
+        new_data[10..12].copy_from_slice(&((count - 1) as u16).to_le_bytes());
+        
+        // Copy element headers (skip deleted)
+        let mut tgt_i = 0usize;
+        for i in 0..count {
+            if i == dIdx { continue; }
+            let src_off = elem_start + i * elem_size;
+            let tgt_off = elem_start + tgt_i * elem_size;
+            new_data[tgt_off..tgt_off + elem_size].copy_from_slice(&leaf_data[src_off..src_off + elem_size]);
+            tgt_i += 1;
+        }
+        
+        // Copy key-value data (compacted)
+        let new_data_start = elem_start + (count - 1) * elem_size;
+        let del_data_start = del_pos as usize;
+        let del_data_end = del_data_start + del_ksize as usize + del_vsize as usize;
+        
+        // Find all data positions
+        let mut all_data_start = elem_start + count * elem_size;
+        let mut all_data_end = all_data_start;
+        for i in 0..count {
+            let elem_offset = elem_start + i * elem_size;
+            let pos = u32::from_le_bytes([leaf_data[elem_offset + 4], leaf_data[elem_offset + 5], leaf_data[elem_offset + 6], leaf_data[elem_offset + 7]]);
+            let ksize = u32::from_le_bytes([leaf_data[elem_offset + 8], leaf_data[elem_offset + 9], leaf_data[elem_offset + 10], leaf_data[elem_offset + 11]]);
+            let vsize = u32::from_le_bytes([leaf_data[elem_offset + 12], leaf_data[elem_offset + 13], leaf_data[elem_offset + 14], leaf_data[elem_offset + 15]]);
+            all_data_start = all_data_start.min(pos as usize);
+            all_data_end = all_data_end.max((pos + ksize + vsize) as usize);
+        }
+        
+        // Copy data before deleted
+        let mut write_pos = elem_start + (count - 1) * elem_size;
+        if all_data_start < del_data_start {
+            let len = del_data_start - all_data_start as usize;
+            new_data[write_pos..write_pos + len].copy_from_slice(&leaf_data[all_data_start as usize..del_data_start]);
+            write_pos += len;
+        }
+        
+        // Copy data after deleted
+        if del_data_end < all_data_end as usize {
+            let len = all_data_end as usize - del_data_end;
+            new_data[write_pos..write_pos + len].copy_from_slice(&leaf_data[del_data_end..del_data_end + len]);
+        }
+        
+        // Update page cache
+        self.db.get_pages().lock().unwrap().insert(leaf_pgid, new_data);
+        
+        Ok(())
     }
 
     /// Iterate over all key-value pairs
@@ -757,5 +886,135 @@ mod tests {
         bucket.set_writable(true);
         let result = bucket.delete(b"");
         assert!(matches!(result, Err(Error::KeyRequired)));
+    }
+
+    fn create_writable_bucket() -> Bucket {
+        let page_size = 4096;
+        let mut data = vec![0u8; page_size * 2]; // 2 pages
+        
+        // Meta page at offset 0
+        let meta = Meta::new(page_size as u32, 0, crate::page::InBucket::new(1, 0), 2, 0);
+        data[0..8].copy_from_slice(&0u64.to_le_bytes());
+        data[8..10].copy_from_slice(&PageFlags::META_PAGE_FLAG.bits().to_le_bytes());
+        data[10..12].copy_from_slice(&0u16.to_le_bytes());
+        data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        
+        let meta_offset = 16;
+        data[meta_offset..meta_offset + 4].copy_from_slice(&meta.magic.to_le_bytes());
+        data[meta_offset + 4..meta_offset + 8].copy_from_slice(&meta.version.to_le_bytes());
+        data[meta_offset + 8..meta_offset + 12].copy_from_slice(&meta.page_size.to_le_bytes());
+        data[meta_offset + 12..meta_offset + 16].copy_from_slice(&meta.flags.to_le_bytes());
+        data[meta_offset + 16..meta_offset + 24].copy_from_slice(&meta.root.root.to_le_bytes());
+        data[meta_offset + 24..meta_offset + 32].copy_from_slice(&meta.root.sequence.to_le_bytes());
+        data[meta_offset + 32..meta_offset + 40].copy_from_slice(&meta.freelist.to_le_bytes());
+        data[meta_offset + 40..meta_offset + 48].copy_from_slice(&meta.pgid.to_le_bytes());
+        data[meta_offset + 48..meta_offset + 56].copy_from_slice(&meta.txid.to_le_bytes());
+        data[meta_offset + 56..meta_offset + 64].copy_from_slice(&meta.checksum.to_le_bytes());
+        
+        // Page 1: root leaf page at offset 4096
+        let page_offset = page_size;
+        data[page_offset..page_offset + 8].copy_from_slice(&1u64.to_le_bytes());
+        data[page_offset + 8..page_offset + 10].copy_from_slice(&PageFlags::LEAF_PAGE_FLAG.bits().to_le_bytes());
+        data[page_offset + 10..page_offset + 12].copy_from_slice(&0u16.to_le_bytes()); // empty
+        data[page_offset + 12..page_offset + 16].copy_from_slice(&0u32.to_le_bytes());
+        
+        let db = TxDatabase::new(page_size, meta, data);
+        let mut bucket = Bucket::with_db(crate::page::InBucket::new(1, 0), db);
+        bucket.set_writable(true);
+        bucket
+    }
+
+    #[test]
+    fn test_create_bucket() {
+        let mut bucket = create_writable_bucket();
+        
+        let result = bucket.create_bucket(b"subbucket");
+        assert!(result.is_ok(), "create_bucket should succeed");
+        
+        // Verify bucket exists
+        assert!(bucket.get_bucket(b"subbucket").is_some());
+    }
+
+    #[test]
+    fn test_create_bucket_empty_name() {
+        let mut bucket = create_writable_bucket();
+        
+        let result = bucket.create_bucket(b"");
+        assert!(matches!(result, Err(Error::BucketNameRequired)));
+    }
+
+    #[test]
+    fn test_create_bucket_twice() {
+        let mut bucket = create_writable_bucket();
+        
+        assert!(bucket.create_bucket(b"subbucket").is_ok());
+        let result = bucket.create_bucket(b"subbucket");
+        assert!(matches!(result, Err(Error::BucketExists)));
+    }
+
+    #[test]
+    fn test_create_bucket_if_not_exists() {
+        let mut bucket = create_writable_bucket();
+        
+        // First create
+        let result1 = bucket.create_bucket_if_not_exists(b"subbucket");
+        assert!(result1.is_ok());
+        
+        // Second call should return existing
+        let result2 = bucket.create_bucket_if_not_exists(b"subbucket");
+        assert!(result2.is_ok());
+    }
+
+    #[test]
+    fn test_create_bucket_if_not_exists_empty_name() {
+        let mut bucket = create_writable_bucket();
+        
+        let result = bucket.create_bucket_if_not_exists(b"");
+        assert!(matches!(result, Err(Error::BucketNameRequired)));
+    }
+
+    #[test]
+    fn test_get_bucket() {
+        let mut bucket = create_writable_bucket();
+        
+        bucket.create_bucket(b"subbucket").unwrap();
+        
+        let nested = bucket.get_bucket(b"subbucket");
+        assert!(nested.is_some());
+    }
+
+    #[test]
+    fn test_get_bucket_not_found() {
+        let bucket = create_writable_bucket();
+        assert!(bucket.get_bucket(b"notexist").is_none());
+    }
+
+    #[test]
+    fn test_delete_bucket() {
+        let mut bucket = create_writable_bucket();
+        
+        bucket.create_bucket(b"subbucket").unwrap();
+        assert!(bucket.get_bucket(b"subbucket").is_some());
+        
+        let result = bucket.delete_bucket(b"subbucket");
+        assert!(result.is_ok());
+        
+        assert!(bucket.get_bucket(b"subbucket").is_none());
+    }
+
+    #[test]
+    fn test_delete_bucket_not_found() {
+        let mut bucket = create_writable_bucket();
+        
+        let result = bucket.delete_bucket(b"notexist");
+        assert!(matches!(result, Err(Error::BucketNotFound)));
+    }
+
+    #[test]
+    fn test_delete_bucket_empty_name() {
+        let mut bucket = create_writable_bucket();
+        
+        let result = bucket.delete_bucket(b"");
+        assert!(matches!(result, Err(Error::BucketNameRequired)));
     }
 }

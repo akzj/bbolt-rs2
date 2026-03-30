@@ -160,16 +160,13 @@ impl Tx {
         let page_size = self.db.page_size();
         let offset = 3 * page_size;
         if data.len() >= offset + 16 {
-            eprintln!("DEBUG committed_data: count at {} = {}", offset+10, u16::from_le_bytes([data[offset+10], data[offset+11]]));
             for i in 0..3 {
                 let elem_offset = offset + 16 + i * 16;
                 let pos = u32::from_le_bytes([data[elem_offset+4], data[elem_offset+5], data[elem_offset+6], data[elem_offset+7]]);
                 let ksize = u32::from_le_bytes([data[elem_offset+8], data[elem_offset+9], data[elem_offset+10], data[elem_offset+11]]);
                 let vsize = u32::from_le_bytes([data[elem_offset+12], data[elem_offset+13], data[elem_offset+14], data[elem_offset+15]]);
-                eprintln!("DEBUG: elem[{}] at {}: pos={}, ksize={}, vsize={}", i, elem_offset, pos, ksize, vsize);
                 if pos > 0 && pos < 4096 && ksize > 0 {
                     let key_end = (pos as usize + ksize as usize).min(4096);
-                    eprintln!("DEBUG: key at {} = {:?}", pos, std::str::from_utf8(&data[offset + pos as usize..offset + key_end]).unwrap_or("?"));
                 }
             }
         }
@@ -180,7 +177,6 @@ impl Tx {
     fn write_pages(&mut self) -> Result<()> {
         let pages = self.db.get_pages().lock().unwrap();
         let pgids: Vec<Pgid> = pages.keys().cloned().collect();
-        eprintln!("DEBUG write_pages: {} dirty pages to write", pgids.len());
         drop(pages);
         for pgid in pgids {
             let pages = self.db.get_pages().lock().unwrap();
@@ -197,7 +193,6 @@ impl Tx {
     fn write_freelist(&self) -> Result<()> {
         let freelist = crate::db::GLOBAL_FREELIST.load();
         let freelist_ids: Vec<Pgid> = freelist.iter().cloned().collect();
-        eprintln!("DEBUG write_freelist: {} free pages to persist", freelist_ids.len());
         
         // Allocate a page for freelist if needed (use page 2, freelist_pgid)
         let freelist_pgid = self.meta.freelist_pgid();
@@ -226,7 +221,6 @@ impl Tx {
         }
         
         self.db.write_page(freelist_pgid, &page_data)?;
-        eprintln!("DEBUG write_freelist: wrote {} IDs to page {}", freelist_ids.len(), freelist_pgid);
         Ok(())
     }
 
@@ -340,7 +334,6 @@ impl TxDatabase {
     pub fn write_page(&self, pgid: Pgid, data: &[u8]) -> Result<()> {
         let offset = pgid as usize * self.page_size;
         let mut db_data = self.data.lock().unwrap();
-        eprintln!("DEBUG write_page: pgid={}, offset={}, db_data.len={}, data.len={}", pgid, offset, db_data.len(), data.len());
         if offset >= db_data.len() {
             // This page is beyond current data - still write it
             db_data.resize(offset + self.page_size, 0);

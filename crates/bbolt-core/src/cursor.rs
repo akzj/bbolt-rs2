@@ -2,8 +2,10 @@
 //!
 //! Cursors provide bidirectional traversal over key-value pairs in a bucket.
 
+use std::cmp::Ordering;
+
 use crate::constants::*;
-use crate::page::Page;
+use crate::page::{Page, Pgid};
 use crate::tx::TxDatabase;
 
 /// Cursor for traversing a bucket
@@ -161,6 +163,172 @@ impl Cursor {
         self.stack.clear();
     }
 
+    /// Seek to a specific key, returning (key, value, flags) if found
+    pub fn seek(&mut self, key: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u32)> {
+        if self.stack.is_empty() || self.db.is_none() {
+            return None;
+        }
+        
+        // Find the leaf page containing the key
+        let mut pgid = self.stack.first()?.page.id;
+        
+        loop {
+            if let Some(ref mut db) = self.db {
+                if let Some(data) = db.page_data(pgid) {
+                    let flags = u16::from_le_bytes([data[8], data[9]]);
+                    
+                    if flags == PageFlags::LEAF_PAGE_FLAG.bits() {
+                        // Found leaf page, search for key
+                        let count = u16::from_le_bytes([data[10], data[11]]) as usize;
+                        let elem_size = 16usize;
+                        let elem_start = 16usize;
+                        
+                        // Binary search for key
+                        let mut low = 0;
+                        let mut high = count;
+                        
+                        while low < high {
+                            let mid = (low + high) / 2;
+                            let elem_offset = elem_start + mid * elem_size;
+                            
+                            let pos = u32::from_le_bytes([
+                                data[elem_offset + 4],
+                                data[elem_offset + 5],
+                                data[elem_offset + 6],
+                                data[elem_offset + 7],
+                            ]) as usize;
+                            let ksize = u32::from_le_bytes([
+                                data[elem_offset + 8],
+                                data[elem_offset + 9],
+                                data[elem_offset + 10],
+                                data[elem_offset + 11],
+                            ]) as usize;
+                            
+                            if pos + ksize > data.len() {
+                                // Key out of bounds, return None
+                                return None;
+                            }
+                            
+                            let elem_key = &data[pos..pos + ksize];
+                            let cmp = elem_key.cmp(key);
+                            
+                            if cmp == Ordering::Less {
+                                low = mid + 1;
+                            } else {
+                                high = mid;
+                            }
+                        }
+                        
+                        // Check if we found the exact key
+                        if low < count {
+                            let elem_offset = elem_start + low * elem_size;
+                            let elem_flags = u32::from_le_bytes([
+                                data[elem_offset],
+                                data[elem_offset + 1],
+                                data[elem_offset + 2],
+                                data[elem_offset + 3],
+                            ]);
+                            let pos = u32::from_le_bytes([
+                                data[elem_offset + 4],
+                                data[elem_offset + 5],
+                                data[elem_offset + 6],
+                                data[elem_offset + 7],
+                            ]) as usize;
+                            let ksize = u32::from_le_bytes([
+                                data[elem_offset + 8],
+                                data[elem_offset + 9],
+                                data[elem_offset + 10],
+                                data[elem_offset + 11],
+                            ]) as usize;
+                            let vsize = u32::from_le_bytes([
+                                data[elem_offset + 12],
+                                data[elem_offset + 13],
+                                data[elem_offset + 14],
+                                data[elem_offset + 15],
+                            ]) as usize;
+                            
+                            let found_key = data[pos..pos + ksize].to_vec();
+                            if found_key == key {
+                                let found_value = data[pos + ksize..pos + ksize + vsize].to_vec();
+                                return Some((found_key, found_value, elem_flags));
+                            }
+                        }
+                        
+                        return None;
+                    } else if flags == PageFlags::BRANCH_PAGE_FLAG.bits() {
+                        // Follow branch to next level
+                        pgid = self.search_branch(&data, key)?;
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+    }
+
+    /// Get the next element with flags
+    pub fn next_with_flags(&mut self) -> Option<(Vec<u8>, Vec<u8>, u32)> {
+        if self.stack.is_empty() || self.db.is_none() {
+            return None;
+        }
+        
+        let elem_size = 16usize;
+        let elem_start = 16usize;
+        
+        loop {
+            let stack_len = self.stack.len();
+            if stack_len == 0 {
+                return None;
+            }
+            
+            let idx = self.stack.len() - 1;
+            let elem_ref = &mut self.stack[idx];
+            let data = elem_ref.data.as_mut()?;
+            let count = u16::from_le_bytes([data[10], data[11]]) as usize;
+            
+            elem_ref.index += 1;
+            
+            if elem_ref.index < count {
+                let elem_offset = elem_start + elem_ref.index * elem_size;
+                let elem_flags = u32::from_le_bytes([
+                    data[elem_offset],
+                    data[elem_offset + 1],
+                    data[elem_offset + 2],
+                    data[elem_offset + 3],
+                ]);
+                let pos = u32::from_le_bytes([
+                    data[elem_offset + 4],
+                    data[elem_offset + 5],
+                    data[elem_offset + 6],
+                    data[elem_offset + 7],
+                ]) as usize;
+                let ksize = u32::from_le_bytes([
+                    data[elem_offset + 8],
+                    data[elem_offset + 9],
+                    data[elem_offset + 10],
+                    data[elem_offset + 11],
+                ]) as usize;
+                let vsize = u32::from_le_bytes([
+                    data[elem_offset + 12],
+                    data[elem_offset + 13],
+                    data[elem_offset + 14],
+                    data[elem_offset + 15],
+                ]) as usize;
+                
+                let key = data[pos..pos + ksize].to_vec();
+                let value = data[pos + ksize..pos + ksize + vsize].to_vec();
+                return Some((key, value, elem_flags));
+            } else {
+                // Pop stack and continue
+                self.stack.pop();
+            }
+        }
+    }
+
     fn seek_to_first(&mut self) {
         while !self.is_leaf() {
             if let Some(pgid) = self.stack.last().and_then(|r| r.first_branch_pgid()) {
@@ -181,6 +349,65 @@ impl Cursor {
 
     fn is_leaf(&self) -> bool {
         self.stack.last().map(|r| r.is_leaf()).unwrap_or(false)
+    }
+
+    /// Search a branch page for the child page containing the key
+    fn search_branch(&self, data: &[u8], key: &[u8]) -> Option<Pgid> {
+        let count = u16::from_le_bytes([data[10], data[11]]) as usize;
+        let elem_size = 16usize;
+        let elem_start = 16usize;
+        
+        // Binary search for the right child
+        let mut low = 0usize;
+        let mut high = count;
+        
+        while low < high {
+            let mid = (low + high) / 2;
+            let elem_offset = elem_start + mid * elem_size;
+            
+            let pos = u32::from_le_bytes([
+                data[elem_offset + 4],
+                data[elem_offset + 5],
+                data[elem_offset + 6],
+                data[elem_offset + 7],
+            ]) as usize;
+            let ksize = u32::from_le_bytes([
+                data[elem_offset + 8],
+                data[elem_offset + 9],
+                data[elem_offset + 10],
+                data[elem_offset + 11],
+            ]) as usize;
+            
+            if pos + ksize > data.len() {
+                return None;
+            }
+            
+            let elem_key = &data[pos..pos + ksize];
+            if elem_key.cmp(key) != Ordering::Less {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        
+        // low is the index of the first key >= search key
+        // For branch pages, we want the child at index low (or count-1 if at end)
+        let idx = if low >= count { count - 1 } else { low };
+        let elem_offset = elem_start + idx * elem_size;
+        
+        // Branch elements store child page IDs in pos field
+        let child_pgid = u64::from_le_bytes([
+            data[elem_offset + 4],
+            data[elem_offset + 5],
+            data[elem_offset + 6],
+            data[elem_offset + 7],
+            data[elem_offset + 8],
+            data[elem_offset + 9],
+            data[elem_offset + 10],
+            data[elem_offset + 11],
+        ]);
+        
+        Some(child_pgid)
     }
 }
 
