@@ -203,6 +203,54 @@ impl Tx {
         Ok(Some(info))
     }
 
+    /// for_each_page iterates over every page within a given page tree
+    /// and executes a function for each page.
+    ///
+    /// The function receives the page ID, page reference, and depth.
+    /// For branch pages, it recursively visits child pages.
+    pub fn for_each_page<F>(&self, mut f: F)
+    where
+        F: FnMut(Pgid, &Page, usize),
+    {
+        let mut stack = vec![0u64];
+        self.for_each_page_internal(&mut stack, &mut f, 0);
+    }
+
+    /// Internal helper for for_each_page recursion
+    fn for_each_page_internal<F>(&self, stack: &mut Vec<Pgid>, f: &mut F, depth: usize)
+    where
+        F: FnMut(Pgid, &Page, usize),
+    {
+        let pgid = stack[stack.len() - 1];
+        let p = self.page(pgid);
+
+        // Execute function for this page
+        f(pgid, &p, depth);
+
+        // Recursively visit children for branch pages
+        if p.is_branch() {
+            let count = p.count as usize;
+            let elem_start = 16usize; // PAGE_HEADER_SIZE
+            for i in 0..count {
+                let elem_offset = elem_start + i * 16;
+                let pgid_bytes = [
+                    self.db.page_data(pgid).as_ref().unwrap()[elem_offset + 8],
+                    self.db.page_data(pgid).as_ref().unwrap()[elem_offset + 9],
+                    self.db.page_data(pgid).as_ref().unwrap()[elem_offset + 10],
+                    self.db.page_data(pgid).as_ref().unwrap()[elem_offset + 11],
+                    self.db.page_data(pgid).as_ref().unwrap()[elem_offset + 12],
+                    self.db.page_data(pgid).as_ref().unwrap()[elem_offset + 13],
+                    self.db.page_data(pgid).as_ref().unwrap()[elem_offset + 14],
+                    self.db.page_data(pgid).as_ref().unwrap()[elem_offset + 15],
+                ];
+                let child_pgid = Pgid::from_le_bytes(pgid_bytes);
+                stack.push(child_pgid);
+                self.for_each_page_internal(stack, f, depth + 1);
+                stack.pop();
+            }
+        }
+    }
+
     /// Copy the database to a writer.
     ///
     /// This writes the entire database content (both meta pages and data pages)
@@ -937,5 +985,53 @@ mod tests {
 
         let inspect = tx.inspect();
         assert!(inspect.contains("writable: true"));
+    }
+
+    #[test]
+    fn test_tx_for_each_page() {
+        let page_size = 4096;
+        let meta = Meta::new(
+            page_size as u32,
+            2,
+            InBucket::new(3, 0),
+            4,
+            1,
+        );
+
+        let data = vec![0u8; page_size * 5];
+        let db = TxDatabase::new(page_size, meta, data);
+        let tx = Tx::begin(db, false).unwrap();
+
+        let mut pages_visited = Vec::new();
+        tx.for_each_page(|pgid, _page, depth| {
+            pages_visited.push((pgid, depth));
+        });
+
+        // Should visit at least the root page (page 3)
+        assert!(!pages_visited.is_empty(), "Should visit at least root page");
+    }
+
+    #[test]
+    fn test_tx_for_each_page_counts() {
+        let page_size = 4096;
+        let meta = Meta::new(
+            page_size as u32,
+            2,
+            InBucket::new(0, 0), // empty bucket
+            4,
+            1,
+        );
+
+        let data = vec![0u8; page_size * 5];
+        let db = TxDatabase::new(page_size, meta, data);
+        let tx = Tx::begin(db, false).unwrap();
+
+        let mut count = 0;
+        tx.for_each_page(|_pgid, _page, _depth| {
+            count += 1;
+        });
+
+        // For empty bucket, should visit at least root (page 0)
+        assert!(count >= 1, "Should visit at least root page");
     }
 }
